@@ -8,6 +8,11 @@
 #include <sys/stat.h>
 
 static const bool scsi_verbose = getenv("SCSIDBG") != nullptr;
+/* AUX-status polls are spammy, so only the first few are logged by default;
+ * SCSIAUXMAX raises the cap when diffing the full PIO stream against another
+ * implementation. */
+static const char *scsi_auxmax_env = getenv("SCSIAUXMAX");
+static const int scsi_auxmax = scsi_auxmax_env ? atoi(scsi_auxmax_env) : 12;
 #define SPRINTF(...) do { if(scsi_verbose) fprintf(stderr, __VA_ARGS__); } while(0)
 
 /* WD33C93 register file indices */
@@ -375,7 +380,7 @@ uint8_t sgi_scsi::pio_r(uint32_t port) {
     if(intrq) a |= AUX_INT;
     if(drq)   a |= AUX_DBR;
     { static int auxlog = 0;
-      if(scsi_verbose && auxlog < 12) {
+      if(scsi_verbose && auxlog < scsi_auxmax) {
         fprintf(stderr, "sgi_scsi: pio_r AUX -> %02x (intrq=%d) @icnt=%llu\n",
                 a, (int)intrq, (unsigned long long)s->icnt); auxlog++; } }
     return a;
@@ -384,10 +389,12 @@ uint8_t sgi_scsi::pio_r(uint32_t port) {
   if(sasr == WD_SCSI_STATUS) {                      /* reading status clears INTRQ */
     uint8_t st = regs[WD_SCSI_STATUS];
     intrq = false; regs[WD_AUX_STATUS] &= ~AUX_INT;
+    SPRINTF("sgi_scsi: pio_r reg=%02x -> %02x\n", (unsigned)sasr, st);
     sasr = (sasr + 1) & 0x1f;
     return st;
   }
   uint8_t r = regs[sasr];
+  SPRINTF("sgi_scsi: pio_r reg=%02x -> %02x\n", (unsigned)sasr, r);
   sasr = (sasr + 1) & 0x1f;
   return r;
 }

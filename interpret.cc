@@ -20,6 +20,7 @@
 #include "interpret.hh"
 #include "sgi_hpc.hh"
 #include "sgi_scc.hh"
+#include "sclog.hh"
 #include "disassemble.hh"
 #include "helper.hh"
 #include "globals.hh"
@@ -40,6 +41,55 @@ static inline double    sf2d(float64_t f){ double d;    std::memcpy(&d, &f.v, 8)
 static inline float32_t s2sf(float s)   { float32_t f; std::memcpy(&f.v, &s, 4); return f; }
 static inline float     sf2s(float32_t f){ float s;     std::memcpy(&s, &f.v, 4); return s; }
 
+/* NANWATCH helpers: a NaN in either MIPS FP format.  cpr1[] holds singles in
+ * bits[31:0] (FR=1), so the format must come from cpr1_state[] or the opcode. */
+static inline bool fp_is_nan(uint64_t v, bool dbl) {
+  if(dbl) {
+    return ((v & 0x7ff0000000000000ULL) == 0x7ff0000000000000ULL) &&
+           ((v & 0x000fffffffffffffULL) != 0);
+  }
+  uint32_t w = static_cast<uint32_t>(v);
+  return ((w & 0x7f800000u) == 0x7f800000u) && ((w & 0x007fffffu) != 0);
+}
+
+static inline double fp_as_double(uint64_t v, bool dbl) {
+  if(dbl) {
+    double d; std::memcpy(&d, &v, 8); return d;
+  }
+  float f; uint32_t w = static_cast<uint32_t>(v); std::memcpy(&f, &w, 4);
+  return static_cast<double>(f);
+}
+
+/* ---- NANWATCH taint calculus -------------------------------------------
+ * A NaN is tagged with its ORIGIN and that tag is carried through every FP
+ * value copy -- register to register, through memory via sdc1/ldc1, and
+ * through arithmetic.  The domain is deliberately tiny: only NaN values carry
+ * a tag, so until the first NaN appears there is nothing to track and the
+ * shadow map stays empty (one predictable branch per FP memory op).
+ *
+ * Origin kinds:
+ *   ARITH -- an FP arithmetic op produced a NaN from non-NaN operands.  This
+ *            is a genuine IEEE invalid and the buck stops here.
+ *   EXTERN -- a NaN arrived by a load or a GPR->FPR move from memory we never
+ *            saw an FP store write.  On perfect hardware running a program
+ *            that computes no NaN, this is the FABRICATION signature: the
+ *            value did not come from any FP computation we observed.
+ * PROPAGATED values keep the tag of the root they came from, so reporting the
+ * tag at the point of use names the ORIGIN, not the last hop. */
+struct nan_taint_t {
+  uint64_t icnt = 0;
+  uint32_t pc = 0;
+  uint32_t inst = 0;
+  uint64_t addr = 0;   /* for an EXTERN origin from a load: the address it came from */
+  uint8_t  kind = 0;   /* 0 = untainted, 1 = ARITH, 2 = EXTERN */
+};
+static nan_taint_t g_ftaint[32];
+static std::unordered_map<uint64_t, nan_taint_t> g_mtaint;   /* FP stores of tainted values, by VA */
+
+static const char *nan_kind_name(uint8_t k) {
+  return (k == 1) ? "ARITH" : (k == 2) ? "EXTERN" : "none";
+}
+
 /* MIPS FCSR.RM (0=RN,1=RZ,2=RP/+inf,3=RM/-inf) -> SoftFloat rounding mode
  * (0=near_even,1=minMag,2=min/-inf,3=max/+inf).  Note RP/RM swap. */
 static inline void sf_set_rm(state_t *s) {
@@ -48,16 +98,21 @@ static inline void sf_set_rm(state_t *s) {
   softfloat_roundingMode = m[ s->fcr1[CP1_CR31] & 3u ];
 }
 /* overloaded so execFP<T,op> resolves f32/f64 by the operand type; caller sets RM. */
-static inline double sf_add(double a,double b){ return sf2d(f64_add(d2sf(a),d2sf(b))); }
-static inline float  sf_add(float  a,float  b){ return sf2s(f32_add(s2sf(a),s2sf(b))); }
-static inline double sf_sub(double a,double b){ return sf2d(f64_sub(d2sf(a),d2sf(b))); }
-static inline float  sf_sub(float  a,float  b){ return sf2s(f32_sub(s2sf(a),s2sf(b))); }
-static inline double sf_mul(double a,double b){ return sf2d(f64_mul(d2sf(a),d2sf(b))); }
-static inline float  sf_mul(float  a,float  b){ return sf2s(f32_mul(s2sf(a),s2sf(b))); }
-static inline double sf_div(double a,double b){ return sf2d(f64_div(d2sf(a),d2sf(b))); }
-static inline float  sf_div(float  a,float  b){ return sf2s(f32_div(s2sf(a),s2sf(b))); }
-static inline double sf_sqrtf(double a){ return sf2d(f64_sqrt(d2sf(a))); }
-static inline float  sf_sqrtf(float  a){ return sf2s(f32_sqrt(s2sf(a))); }
+/* FP_NATIVE: do the arithmetic with the HOST x86 FPU instead of SoftFloat.
+ * Differential knob only -- it is NOT MIPS-conformant (host rounding mode, x86
+ * NaN payloads), but if a failure survives the switch then the arithmetic
+ * implementation is exonerated and the fault lies elsewhere. */
+static const bool g_fp_native = getenv("FP_NATIVE") != nullptr;
+static inline double sf_add(double a,double b){ return g_fp_native ? (a+b) : sf2d(f64_add(d2sf(a),d2sf(b))); }
+static inline float  sf_add(float  a,float  b){ return g_fp_native ? (a+b) : sf2s(f32_add(s2sf(a),s2sf(b))); }
+static inline double sf_sub(double a,double b){ return g_fp_native ? (a-b) : sf2d(f64_sub(d2sf(a),d2sf(b))); }
+static inline float  sf_sub(float  a,float  b){ return g_fp_native ? (a-b) : sf2s(f32_sub(s2sf(a),s2sf(b))); }
+static inline double sf_mul(double a,double b){ return g_fp_native ? (a*b) : sf2d(f64_mul(d2sf(a),d2sf(b))); }
+static inline float  sf_mul(float  a,float  b){ return g_fp_native ? (a*b) : sf2s(f32_mul(s2sf(a),s2sf(b))); }
+static inline double sf_div(double a,double b){ return g_fp_native ? (a/b) : sf2d(f64_div(d2sf(a),d2sf(b))); }
+static inline float  sf_div(float  a,float  b){ return g_fp_native ? (a/b) : sf2s(f32_div(s2sf(a),s2sf(b))); }
+static inline double sf_sqrtf(double a){ return g_fp_native ? __builtin_sqrt(a)  : sf2d(f64_sqrt(d2sf(a))); }
+static inline float  sf_sqrtf(float  a){ return g_fp_native ? __builtin_sqrtf(a) : sf2s(f32_sqrt(s2sf(a))); }
 
 static fpMode currFpMode = fpMode::mips3;  /* IRIX N32 = MIPS-III, FR=1 flat 64-bit FP regs (odd regs legal, no fd+1 pairing) */
 
@@ -158,7 +213,7 @@ void initState(state_t *s) {
   /* Random starts at max TLB index; it cycles downward to Wired */
   s->cpr0[CPR0_RANDOM] = state_t::NUM_TLB_ENTRIES - 1;
   /* PRId: read-only processor id (R4000 family for now) */
-  { const char *pe = getenv("PRID"); uint32_t pv = pe ? (uint32_t)strtoull(pe,0,0) : PRID_VALUE;
+  { const char *pe = getenv("PRID"); uint32_t pv = pe ? (uint32_t)strtoull(pe,0,0) : (globals::cpu_r5000 ? PRID_R5000 : PRID_VALUE);
     s->cpr0[CPR0_PRID] = pv; s->cpr0_64[CPR0_PRID] = pv; }
   /* Config: R4600 cache geometry (16 KB I$ + 16 KB D$, 32-byte lines, K0=3),
    * matching the real SGI Indy / MAME. mlreset derives cachecolormask from this;
@@ -168,9 +223,20 @@ void initState(state_t *s) {
    * the RTL reports a 16-byte D-cache line (Config DB=0) while the default above says
    * 32 (DB=1), so cpu_probe's software CLZ over Config takes a different branch and the
    * streams diverge ~149k insns in.  Use CP0CONFIG=0x0002e4a3 to match the RTL.
-   * Do NOT change the default -- IRIX needs the Indy/MAME geometry (see above). */
+   * Do NOT change the default -- IRIX needs the Indy/MAME geometry (see above).
+   * --cpu r5000: same word with IC=DC=3 (32 KB each, 2-way on the R5000), still
+   * SC=1 (no secondary cache: the R5000PC Indy, SPEC95's "no L2" machine). */
   { const char *ce = getenv("CP0CONFIG");
-    uint32_t cv = ce ? (uint32_t)strtoull(ce, 0, 0) : 0x0002e4b3u;
+    uint32_t cv = ce ? (uint32_t)strtoull(ce, 0, 0) : (globals::cpu_r5000 ? 0x0002e6f3u : 0x0002e4b3u);
+    /* SCSIZE=<bytes>: claim a secondary cache (Config.SC=0) so IRIX sizes it and
+     * issues SD cache ops; SCLINE=<16|32|64|128> sets Config.SB (default 16).  The
+     * ISS has no caches: SD ops are only logged (SCLOG) and the tag ops emulated
+     * well enough for size_2nd_cache's probe. */
+    if(getenv("SCSIZE")) {
+      uint32_t ln = getenv("SCLINE") ? (uint32_t)strtoul(getenv("SCLINE"), 0, 0) : 16;
+      uint32_t sb = (ln >= 128) ? 3 : (ln >= 64) ? 2 : (ln >= 32) ? 1 : 0;
+      cv = (cv & ~((1u << 17) | (3u << 22))) | (sb << 22);
+    }
     s->cpr0[CPR0_CONFIG] = cv;
     s->cpr0_64[CPR0_CONFIG] = cv; }
 }
@@ -265,6 +331,54 @@ static const uint64_t INT_POLL = getenv("INT_POLL") ? strtoull(getenv("INT_POLL"
 static uint64_t g_ty_timer=0, g_ty_tlbmiss=0, g_ty_idle_tlbmiss=0, g_ty_timer_in_tlbmiss=0, g_ty_timer_idle=0, g_ty_pda_miss=0;
 static inline bool ty_in_tlbmiss(uint32_t pc){ return pc>=0x880196bcu && pc<=0x880196e0u; }
 static inline bool ty_idle_sp(uint32_t sp){ return (sp & 0xfffff000u)==0x8834a000u; }
+/* R4400 PageMask encodings: 4K 16K 64K 256K 1M 4M 16M (huge pages use 1M pairs) */
+/* TLBPMSTATS: histogram of tlbwi/tlbwr by page size (PageMask), split user (EntryHi VA
+ * below 0x80000000) vs kernel.  Answers "is IRIX really mapping large pages" (dplace
+ * -data_pagesize).  Printed by tlbpm_report() on SIGUSR1. */
+static const bool g_tlbpm_on = getenv("TLBPMSTATS") != nullptr;
+static uint64_t g_tlbpm[2][7];
+static void tlbpm_count(uint64_t entry_hi, uint32_t pm) {
+  uint32_t sz = __builtin_popcount(pm >> 13) / 2;   /* 0=4K 1=16K 2=64K .. 6=16M */
+  bool kern = ((uint32_t)entry_hi >= 0x80000000u) || ((entry_hi >> 62) == 3);
+  g_tlbpm[kern ? 1 : 0][sz]++;
+}
+void tlbpm_report() {
+  if(!g_tlbpm_on) {
+    return;
+  }
+  static const char *nm[7] = {"4K", "16K", "64K", "256K", "1M", "4M", "16M"};
+  for(int k = 0; k < 2; k++) {
+    fprintf(stderr, "[tlbpm] %s:", k ? "kernel" : "user");
+    for(int i = 0; i < 7; i++) {
+      fprintf(stderr, " %s=%llu", nm[i], (unsigned long long)g_tlbpm[k][i]);
+    }
+    fprintf(stderr, "\n");
+  }
+}
+
+static inline bool valid_page_mask(uint32_t pm) {
+  switch(pm)
+    {
+    case 0x0000000: case 0x0006000: case 0x001e000: case 0x007e000:
+    case 0x01fe000: case 0x07fe000: case 0x1ffe000:
+      return true;
+    default:
+      return false;
+    }
+}
+
+/* r9999-virt harness: stop the run when the console prints "fpga_done" (the
+ * initramfs /init's completion marker), as interp_rv64 does. */
+static void console_watch(state_t *s, char c) {
+  static const char marker[] = "fpga_done";
+  static unsigned matched = 0;
+  matched = (c == marker[matched]) ? (matched + 1) : ((c == marker[0]) ? 1 : 0);
+  if(matched == sizeof(marker) - 1) {
+    s->brk = 1;
+    matched = 0;
+  }
+}
+
 void maybe_take_interrupt(state_t *s) {
   { static const unsigned long g_pcs = getenv("PCSAMPLE") ? strtoul(getenv("PCSAMPLE"),0,0) : 0;
     if(g_pcs && (s->icnt % g_pcs) == 0)
@@ -620,16 +734,56 @@ void raise_int(state_t *s, uint32_t epc) {
   s->pc = sext32(0xBFC00180u);
 }
 
+/* The FP condition code lives ARCHITECTURALLY IN FCSR: FCC0 at bit 23, FCC1..7
+ * at bits 25..31 (R4400/MIPS III has only FCC0).  R4400 manual, Control/Status
+ * Register Condition Bit: "the result is stored at bit 23, the Condition bit, to
+ * save or restore the state of the condition line ... Bit 23 is affected only by
+ * compare and Move Control To FPU instructions" -- Move Control To FPU is CTC1.
+ * FCCR (FCR25) is an ALTERNATE VIEW of the same bits, not a second copy.
+ *
+ * This used to keep the condition code only in FCR25 while CTC1/CFC1 touched
+ * only FCR31, so `ctc1 $t,$31` (exactly what an FP context restore does) never
+ * reached the bit BC1T/BC1F read, and a compare never reached the bit CFC1
+ * returns.  The r9999 RTL has the SAME split, which is why the co-sim never
+ * caught it -- see tests/fpu/fp_fcc.S. */
+static inline uint32_t fcc_bit(uint32_t cc) {
+  return (cc == 0) ? 23u : (24u + cc);
+}
+
 static uint32_t getConditionCode(state_t *s, uint32_t cc) {
-  return ((s->fcr1[CP1_CR25] & (1U<<cc)) >> cc) & 0x1;
+  return (s->fcr1[CP1_CR31] >> fcc_bit(cc)) & 0x1u;
+}
+
+/* keep the FCR25 view in step with the FCSR bits */
+static inline void fcc_mirror_to_fccr(state_t *s) {
+  uint32_t f = s->fcr1[CP1_CR31];
+  uint32_t v = (f >> 23) & 0x1u;
+  for(uint32_t c = 1; c < 8; c++) {
+    v |= ((f >> (24u + c)) & 0x1u) << c;
+  }
+  s->fcr1[CP1_CR25] = v;
+}
+
+/* and the reverse, for a write to FCR25 */
+static inline void fcc_mirror_from_fccr(state_t *s) {
+  uint32_t v = s->fcr1[CP1_CR25];
+  uint32_t f = s->fcr1[CP1_CR31] & ~((1u<<23) | 0xfe000000u);
+  f |= (v & 1u) << 23;
+  for(uint32_t c = 1; c < 8; c++) {
+    f |= ((v >> c) & 1u) << (24u + c);
+  }
+  s->fcr1[CP1_CR31] = f;
 }
 
 static void setConditionCode(state_t *s, uint32_t v, uint32_t cc) {
-  uint32_t m0,m1,m2;
-  m0 = 1U<<cc;
-  m1 = ~m0;
-  m2 = ~(v-1);
-  s->fcr1[CP1_CR25] = (s->fcr1[CP1_CR25] & m1) | ((1U<<cc) & m2);
+  uint32_t b = fcc_bit(cc);
+  if(v) {
+    s->fcr1[CP1_CR31] |= (1u << b);
+  }
+  else {
+    s->fcr1[CP1_CR31] &= ~(1u << b);
+  }
+  fcc_mirror_to_fccr(s);
 }
 
 
@@ -897,78 +1051,6 @@ static void iss_tlbdup_check(state_t *s, uint32_t idx, const char *how) {
   }
 }
 
-/* ---- L1 VIPT alias-frequency instrument (env L1_ALIAS) --------------------
- * Measures how often the SAME physical line is resident under two DIFFERENT VA
- * alias-indices -- i.e. how often IRIX's page coloring fails to keep a VIPT L1
- * alias-free.  That count IS the back-invalidate rate an inclusive-L2 alias-
- * resolution scheme would incur at a given L1 size.  One run sweeps several L1
- * sizes (16B lines, direct-mapped = r9999 L1D geometry; a 4KB L1's index is a
- * subset of the 4KB page offset so it can never alias -> sanity 0).  Fed every
- * cacheable DATA access (va,pa) from va_translate. */
-namespace {
-  struct alias_l1 {
-    static const uint32_t NOVAL = 0xffffffffu;
-    uint32_t kb = 0, lg_sets = 0;
-    std::vector<uint32_t> tag;               /* resident line_pa per set (NOVAL = empty) */
-    uint64_t n_back_inval = 0;
-    void init(uint32_t kb_) {
-      kb = kb_;
-      uint32_t sets = (kb * 1024u) / 16u;    /* 16B lines */
-      lg_sets = 0; while((1u << lg_sets) < sets) { lg_sets++; }
-      tag.assign(1u << lg_sets, NOVAL);
-    }
-    void access(uint32_t va, uint32_t pa) {
-      uint32_t set = (va >> 4) & ((1u << lg_sets) - 1);
-      uint32_t lpa = pa >> 4;
-      if(tag[set] == lpa) { return; }        /* hit at this alias-index */
-      if(lg_sets > 8) {                      /* >4KB: alias index bits (>= bit 8) exist */
-        uint32_t inpage = set & 0xffu;       /* page-offset index bits [11:4] = 256 lines/4KB page */
-        for(uint32_t a = 0; a < (1u << (lg_sets - 8)); a++) {
-          uint32_t aset = inpage | (a << 8);
-          if(aset != set && tag[aset] == lpa) { n_back_inval++; tag[aset] = NOVAL; }
-        }
-      }
-      tag[set] = lpa;                        /* fill (conflict-evict implicit) */
-    }
-  };
-  bool g_alias_init = false, g_alias_on = false;
-  std::vector<alias_l1> g_alias_d, g_alias_i;   /* D-side and I-side sweeps */
-  uint64_t g_alias_d_n = 0, g_alias_i_n = 0;
-  inline void alias_ensure_init() {
-    if(g_alias_init) { return; }
-    g_alias_init = true;
-    if(getenv("L1_ALIAS")) {
-      g_alias_on = true;
-      for(uint32_t kb : {4u, 8u, 16u, 32u, 64u}) {
-        alias_l1 md; md.init(kb); g_alias_d.push_back(md);
-        alias_l1 mi; mi.init(kb); g_alias_i.push_back(mi);
-      }
-    }
-  }
-  inline void alias_access(uint32_t va, uint32_t pa) {         /* D-side (load/store) */
-    alias_ensure_init(); if(!g_alias_on) { return; }
-    g_alias_d_n++; for(auto &m : g_alias_d) { m.access(va, pa); }
-  }
-  inline void alias_fetch_access(uint32_t va, uint32_t pa) {   /* I-side (fetch) */
-    alias_ensure_init(); if(!g_alias_on) { return; }
-    g_alias_i_n++; for(auto &m : g_alias_i) { m.access(va, pa); }
-  }
-}
-void l1_alias_report() {
-  if(!g_alias_on) { return; }
-  auto dump = [](const char *side, std::vector<alias_l1> &v, uint64_t n) {
-    fprintf(stderr, "\n[L1_ALIAS] %s-side cacheable accesses = %llu\n", side, (unsigned long long)n);
-    for(auto &m : v) {
-      fprintf(stderr, "[L1_ALIAS]  %s %2u KB (%u sets, %u alias bits): back-invalidates = %llu  (%.3e/access; 1 per %.0f)\n",
-              side, m.kb, 1u << m.lg_sets, (m.lg_sets > 8 ? m.lg_sets - 8 : 0),
-              (unsigned long long)m.n_back_inval,
-              n ? (double)m.n_back_inval / (double)n : 0.0,
-              m.n_back_inval ? (double)n / (double)m.n_back_inval : 0.0);
-    }
-  };
-  dump("D", g_alias_d, g_alias_d_n);
-  dump("I", g_alias_i, g_alias_i_n);
-}
 
 static uint32_t va_translate_inner(state_t *s, uint64_t va, tlb_op op) {
   uint32_t hi32 = (uint32_t)(va >> 32);
@@ -1211,6 +1293,13 @@ static inline void ptetrack_probe(state_t *, uint32_t, uint32_t) {}
 /* wrapper: feed every successful cacheable DATA access (va,pa) to the VIPT
  * alias-frequency instrument, then return the PA unchanged. */
 static uint32_t va_translate(state_t *s, uint64_t va, tlb_op op) {
+  if(g_wsprof && op == tlb_op::store) {                 /* WS profiler markers */
+    uint32_t v32 = (uint32_t)va;
+    if((v32 & 0xfffff000u) == 0x30000000u || (v32 & 0xfffff000u) == 0x30001000u)
+      fprintf(stderr, "### WSMARK store va=%08x\n", v32);
+    if(v32 == 0x30000000u) { g_wsprof->reset(); fprintf(stderr,"### WSRESET\n"); }
+    else if(v32 == 0x30001000u) { g_wsprof->dump("benchmark"); }
+  }
   uint32_t pa = va_translate_inner(s, va, op);
   static const bool g_nvlog = getenv("NVLOG") != nullptr;
   if(g_nvlog and op == tlb_op::load
@@ -1226,16 +1315,6 @@ static uint32_t va_translate(state_t *s, uint64_t va, tlb_op op) {
   if(g_eccfg and op == tlb_op::store and (pa & ~0x3u) >= 0x08308ec0u and (pa & ~0x3u) <= 0x08309500u) {
     fprintf(stderr, "[eccfg] pc=%08x va=%08x pa=%08x (ec-config write)\n",
             (uint32_t)s->pc, (uint32_t)va, pa);
-  }
-  if(!s->tlb_fault) {
-    if(op != tlb_op::fetch) {
-      if(s->mem.cache_active) { alias_access((uint32_t)va, pa); }   /* D-side */
-    } else {
-      /* I-side: cacheable fetch = not the kseg1 uncached window (PROM) */
-      uint32_t lo = (uint32_t)va, hi = (uint32_t)(va >> 32);
-      bool kseg1 = (hi == 0 || hi == 0xffffffffu) && ((lo >> 29) == 5u);
-      if(!kseg1) { alias_fetch_access(lo, pa); }
-    }
   }
   return pa;
 }
@@ -1285,13 +1364,23 @@ struct c1xExec {
     T _fs = *reinterpret_cast<T*>(s->cpr1+insn.fs);
     T _ft = *reinterpret_cast<T*>(s->cpr1+insn.ft);
     T &_fd = *reinterpret_cast<T*>(s->cpr1+insn.fd);  
+    /* MIPS IV madd/msub/nmadd/nmsub are NOT fused: the product is rounded to the
+     * format first (R5000/R10000; the R8000 was the fused exception).  The volatile
+     * keeps clang -march=native (-ffp-contract=on) from emitting an FMA. */
+    volatile T _p = _fs*_ft;
     switch(insn.id)
       {
       case 4:
-	_fd = _fs*_ft + _fr;
+	_fd = _p + _fr;
 	break;
       case 5:
-	_fd = _fs*_ft - _fr;
+	_fd = _p - _fr;
+	break;
+      case 6:
+	_fd = -(_p + _fr);
+	break;
+      case 7:
+	_fd = -(_p - _fr);
 	break;
       default:
 	std::cerr << "unhandled coproc1x insn @ 0x"
@@ -1316,6 +1405,16 @@ void lxc1(uint32_t inst, state_t *s) {
   s->pc += 4;
 }
 
+/* swxc1/sdxc1: FPR[fs] -> mem[base+index]; fs is inst[15:11] (lwxc1_t.pad) */
+template <bool EL, typename T>
+void sxc1(uint32_t inst, state_t *s) {
+  mips_t mi(inst);
+  uint32_t ea = va_translate(s, s->gpr[mi.lc1x.base] + s->gpr[mi.lc1x.index], tlb_op::store);
+  if(s->tlb_fault) return;
+  s->mem.set<T>(ea, bswap<EL>(*reinterpret_cast<T*>(s->cpr1 + mi.lc1x.pad)));
+  s->pc += 4;
+}
+
 template <bool EL>
 static void execCoproc1x(uint32_t inst, state_t *s) {
   mips_t mi(inst);
@@ -1329,6 +1428,18 @@ static void execCoproc1x(uint32_t inst, state_t *s) {
     case 1:
       //ldxc1
       lxc1<EL,int64_t>(inst, s);
+      return;
+    case 8:
+      //swxc1
+      sxc1<EL,int32_t>(inst, s);
+      return;
+    case 9:
+      //sdxc1
+      sxc1<EL,int64_t>(inst, s);
+      return;
+    case 15:
+      //prefx: a hint, like pref
+      s->pc += 4;
       return;
     default:
       break;
@@ -1840,7 +1951,7 @@ static void _cfc1(uint32_t inst, state_t *s) {
   uint32_t cr = (inst>>11) & 31;
   uint32_t rt = (inst>>16) & 31;
   /* GPR[rt] = sign_extend32(FCR[cr]); FCR0 is the read-only FIR */
-  uint32_t v = (cr == 0) ? 0x00000500u : (uint32_t)s->fcr1[fcr_index(cr)];
+  uint32_t v = (cr == 0) ? (globals::cpu_r5000 ? 0x00002320u : 0x00000500u) : (uint32_t)s->fcr1[fcr_index(cr)];
   s->gpr[rt] = (int64_t)(int32_t)v;
   s->pc += 4;
   HISTO(s, mipsInsn::CFC1);
@@ -1849,9 +1960,18 @@ static void _cfc1(uint32_t inst, state_t *s) {
 static void _ctc1(uint32_t inst, state_t *s) {
   uint32_t cr = (inst>>11) & 31;
   uint32_t rt = (inst>>16) & 31;
-  /* FCR[cr] = GPR[rt][31:0]; FCR0 (FIR) is read-only */
-  if(cr != 0)
+  /* FCR[cr] = GPR[rt][31:0]; FCR0 (FIR) is read-only.  FCSR and FCCR are two
+   * views of the same condition-code bits, so a write to either must update the
+   * other -- this is the path an FP context restore takes. */
+  if(cr != 0) {
     s->fcr1[fcr_index(cr)] = (uint32_t)s->gpr[rt];
+    if(cr == 31) {
+      fcc_mirror_to_fccr(s);
+    }
+    else if(cr == 25) {
+      fcc_mirror_from_fccr(s);
+    }
+  }
   s->pc += 4;
   HISTO(s, mipsInsn::CTC1);
 }
@@ -2517,22 +2637,22 @@ static void fpCmp(uint32_t inst, state_t *s) {
     {
     case COND_UN:
       v = (Tfs == Tft);
-      s->fcr1[CP1_CR25] = setBit(s->fcr1[CP1_CR25],v,cc);
+      setConditionCode(s, v, cc);   /* FCSR bit 23/25.. is architectural; FCCR mirrors it */
       break;
     case COND_EQ:
       v = (Tfs == Tft);
       HISTO(s, select_fp_insn<T>(mipsInsn::DP_CMP_EQ, mipsInsn::SP_CMP_EQ));            
-      s->fcr1[CP1_CR25] = setBit(s->fcr1[CP1_CR25],v,cc);
+      setConditionCode(s, v, cc);   /* FCSR bit 23/25.. is architectural; FCCR mirrors it */
       break;
     case COND_LT:
       v = (Tfs < Tft);
       HISTO(s, select_fp_insn<T>(mipsInsn::DP_CMP_LT, mipsInsn::SP_CMP_LT));      
-      s->fcr1[CP1_CR25] = setBit(s->fcr1[CP1_CR25],v,cc);
+      setConditionCode(s, v, cc);   /* FCSR bit 23/25.. is architectural; FCCR mirrors it */
       break;
     case COND_LE:
       v = (Tfs <= Tft);
       HISTO(s, select_fp_insn<T>(mipsInsn::DP_CMP_LE, mipsInsn::SP_CMP_LE));            
-      s->fcr1[CP1_CR25] = setBit(s->fcr1[CP1_CR25],v,cc);
+      setConditionCode(s, v, cc);   /* FCSR bit 23/25.. is architectural; FCCR mirrors it */
       break;
     default:
       printf("unimplemented %s = %s\n", __func__, getCondName(cond).c_str());
@@ -2587,6 +2707,52 @@ static void _c(uint32_t inst, state_t *s) {
 template<typename T>
 static inline bool fp_is_denorm(T x) { return std::fpclassify(x) == FP_SUBNORMAL; }
 
+/* Legacy-MIPS QUIET NaN: exponent all ones, nonzero significand, significand
+ * MSB CLEAR (the quiet bit is inverted vs IEEE 754-2008, so MSB SET = signaling).
+ * The R4400 manual lists "Quiet Not a Number operand, except for Compare" among
+ * the conditions that signal Unimplemented (E); MAME's r4000.cpp implements it,
+ * we historically did not.  FP_QNAN_TRAP turns it on for A/B testing. */
+template<typename T> static inline bool fp_is_qnan(T x);
+template<> inline bool fp_is_qnan<double>(double x) {
+  uint64_t u; std::memcpy(&u, &x, 8);
+  return ((u & 0x7ff0000000000000ULL) == 0x7ff0000000000000ULL) &&
+         ((u & 0x000fffffffffffffULL) != 0) &&
+         ((u & 0x0008000000000000ULL) == 0);
+}
+template<> inline bool fp_is_qnan<float>(float x) {
+  uint32_t u; std::memcpy(&u, &x, 4);
+  return ((u & 0x7f800000u) == 0x7f800000u) &&
+         ((u & 0x007fffffu) != 0) &&
+         ((u & 0x00400000u) == 0);
+}
+
+/* FPTRAPCOUNT: how often does an FP op actually trap to the OS emulator, and why?
+ * With uni_divider the only remaining traps are denormal operand / underflowing
+ * result, so this answers directly -- rather than by PC sampling -- whether the
+ * IRIX soft-float emulator is reachable at all in a given workload. */
+static uint64_t g_fptrap[8];
+static const char *g_fptrap_name[8] =
+  { "add", "sub", "mul", "div", "sqrt", "rsqrt", "recip", "other" };
+struct fptrap_report_t {
+  ~fptrap_report_t() {
+    if(!getenv("FPTRAPCOUNT")) {
+      return;
+    }
+    uint64_t tot = 0;
+    for(int i = 0; i < 8; i++) {
+      tot += g_fptrap[i];
+    }
+    fprintf(stderr, "[fptrap] total=%llu", (unsigned long long)tot);
+    for(int i = 0; i < 8; i++) {
+      if(g_fptrap[i]) {
+        fprintf(stderr, " %s=%llu", g_fptrap_name[i], (unsigned long long)g_fptrap[i]);
+      }
+    }
+    fprintf(stderr, "\n");
+  }
+};
+static fptrap_report_t g_fptrap_report;
+
 template<typename T, fpOperation op>
 static inline bool fp_e_trap(T fs, T ft) {
   /* FP_DIVTRAP models the PRE-uni_divider machine (fpu.sv raised E for every
@@ -2595,19 +2761,107 @@ static inline bool fp_e_trap(T fs, T ft) {
    * uni_divider.sv's w_in_denorm / w_denorm.  rsqrt/recip are MIPS IV and are
    * still not implemented in HW (fpu.sv FP_UNIMPL -> always E). */
   static const bool g_divtrap = getenv("FP_DIVTRAP") != nullptr;
+  static const bool g_qnantrap = getenv("FP_QNAN_TRAP") != nullptr;
+  /* FP_HW_DENORM: compute denormals in "hardware" (SoftFloat handles them
+   * correctly) instead of raising E and letting the OS emulator do it.  This is
+   * what QEMU and IRIS do; it is NOT R4400-conformant (the manual traps on a
+   * denormal operand unconditionally), but it is the knob that tests whether the
+   * emulator excursion itself is what corrupts these benchmarks. */
+  static const bool g_hwden = getenv("FP_HW_DENORM") != nullptr;
+  if(g_qnantrap) {
+    /* ft is only an operand for the two-source ops; sqrt/rsqrt/recip read fs only
+     * and would otherwise trap on whatever happens to sit in the ft field. */
+    bool two_src = (op == fpOperation::add) || (op == fpOperation::sub) ||
+                   (op == fpOperation::mul) || (op == fpOperation::div);
+    if(fp_is_qnan(fs) || (two_src && fp_is_qnan(ft))) {
+      return true;
+    }
+  }
   switch(op) {
   case fpOperation::rsqrt: case fpOperation::recip:
-    return true;                                  /* fpu.sv FP_UNIMPL: always E */
+    return !globals::cpu_r5000;                   /* fpu.sv FP_UNIMPL: always E; HW on the R5000 */
   case fpOperation::div:
-    return g_divtrap || fp_is_denorm(fs) || fp_is_denorm(ft) || fp_is_denorm((T)(fs/ft));
+    return g_divtrap || (!g_hwden && (fp_is_denorm(fs)||fp_is_denorm(ft)||fp_is_denorm((T)(fs/ft))));
   case fpOperation::sqrt:
-    return g_divtrap || fp_is_denorm(fs) || fp_is_denorm((T)std::sqrt((double)fs));
-  case fpOperation::add: return fp_is_denorm(fs)||fp_is_denorm(ft)||fp_is_denorm((T)(fs+ft));
-  case fpOperation::sub: return fp_is_denorm(fs)||fp_is_denorm(ft)||fp_is_denorm((T)(fs-ft));
-  case fpOperation::mul: return fp_is_denorm(fs)||fp_is_denorm(ft)||fp_is_denorm((T)(fs*ft));
+    return g_divtrap || (!g_hwden && (fp_is_denorm(fs)||fp_is_denorm((T)std::sqrt((double)fs))));
+  case fpOperation::add: return !g_hwden && (fp_is_denorm(fs)||fp_is_denorm(ft)||fp_is_denorm((T)(fs+ft)));
+  case fpOperation::sub: return !g_hwden && (fp_is_denorm(fs)||fp_is_denorm(ft)||fp_is_denorm((T)(fs-ft)));
+  case fpOperation::mul: return !g_hwden && (fp_is_denorm(fs)||fp_is_denorm(ft)||fp_is_denorm((T)(fs*ft)));
   default: return false;                          /* abs/neg/mov: no E */
   }
 }
+
+
+/* ---- FP_COSIM: per-op SoftFloat-vs-host differential -------------------
+ * Runs BOTH implementations on every arithmetic op but KEEPS the SoftFloat
+ * result, so the instruction stream is bit-identical to a normal run and the
+ * comparison is not confounded by divergent control flow (the mistake the
+ * FP_NATIVE arm made -- it ignores FCSR.RM, so every benchmark took different
+ * branches and nothing could be concluded).
+ * Only compared when FCSR.RM == 0 (round-to-nearest); the host rounding mode is
+ * not steered, so any other RM is counted and skipped rather than reported as a
+ * divergence.  NaN-vs-NaN is a payload difference (x86 vs MIPS-legacy) and is
+ * counted separately.  Anything left is a REAL arithmetic divergence. */
+static uint64_t g_cos_cmp, g_cos_skip_rm, g_cos_nan, g_cos_real;
+
+template<typename T>
+static inline uint64_t fp_bits(T v) {
+  if(sizeof(T) == 8) { uint64_t u; std::memcpy(&u, &v, 8); return u; }
+  uint32_t u; std::memcpy(&u, &v, 4); return (uint64_t)u;
+}
+
+template<typename T, fpOperation op>
+static inline void fp_cosim_check(state_t *s, T fs, T ft, T got) {
+  T nat;
+  switch(op) {
+  case fpOperation::add:  nat = fs + ft; break;
+  case fpOperation::sub:  nat = fs - ft; break;
+  case fpOperation::mul:  nat = fs * ft; break;
+  case fpOperation::div:  nat = fs / ft; break;
+  case fpOperation::sqrt: nat = (T)__builtin_sqrt((double)fs); break;
+  default: return;
+  }
+  if((s->fcr1[CP1_CR31] & 3u) != 0u) {
+    g_cos_skip_rm++;
+    return;
+  }
+  g_cos_cmp++;
+  /* FP_COSIM_INJECT=<n>: corrupt the n'th compared result so the REAL-divergence
+   * branch is exercised.  Without this the NaN-payload path is the only one the
+   * smoke test covers, and a broken classifier would look like a clean run. */
+  static const uint64_t g_inj = getenv("FP_COSIM_INJECT") ? strtoull(getenv("FP_COSIM_INJECT"),0,0) : 0;
+  if(g_inj && g_cos_cmp == g_inj) {
+    uint64_t b = fp_bits(got) ^ 1ULL;
+    std::memcpy(&got, &b, sizeof(T));
+  }
+  if(fp_bits(nat) == fp_bits(got)) {
+    return;
+  }
+  if((nat != nat) && (got != got)) {   /* both NaN: payload convention only */
+    g_cos_nan++;
+    return;
+  }
+  g_cos_real++;
+  if(g_cos_real <= 40) {
+    fprintf(stderr, "[cosim] REAL DIVERGENCE op=%d sz=%zu icnt=%llu pc=%08x\n",
+            (int)op, sizeof(T), (unsigned long long)s->icnt, (uint32_t)s->pc);
+    fprintf(stderr, "[cosim]   fs=%016llx ft=%016llx  softfloat=%016llx host=%016llx\n",
+            (unsigned long long)fp_bits(fs), (unsigned long long)fp_bits(ft),
+            (unsigned long long)fp_bits(got), (unsigned long long)fp_bits(nat));
+    fprintf(stderr, "[cosim]   %.17g op %.17g -> sf %.17g / host %.17g\n",
+            (double)fs, (double)ft, (double)got, (double)nat);
+  }
+}
+
+struct cosim_report_t {
+  ~cosim_report_t() {
+    if(!getenv("FP_COSIM")) { return; }
+    fprintf(stderr, "[cosim] compared=%llu real_divergences=%llu nan_payload=%llu skipped_rm=%llu\n",
+            (unsigned long long)g_cos_cmp, (unsigned long long)g_cos_real,
+            (unsigned long long)g_cos_nan, (unsigned long long)g_cos_skip_rm);
+  }
+};
+static cosim_report_t g_cosim_report;
 
 template< typename T, fpOperation op>
 static void execFP(uint32_t inst, state_t *s) {
@@ -2629,6 +2883,13 @@ static void execFP(uint32_t inst, state_t *s) {
       want_trap = false;
     }
     if(want_trap) {
+      {
+        int slot = (op == fpOperation::add) ? 0 : (op == fpOperation::sub) ? 1
+                 : (op == fpOperation::mul) ? 2 : (op == fpOperation::div) ? 3
+                 : (op == fpOperation::sqrt) ? 4 : (op == fpOperation::rsqrt) ? 5
+                 : (op == fpOperation::recip) ? 6 : 7;
+        g_fptrap[slot]++;
+      }
       static const bool g_fpelog = getenv("FPELOG") != nullptr;
       if(g_fpelog) {
         fprintf(stderr, "[fpe] op=%d sz=%zu fs=%.17g ft=%.17g epc=%08x icnt=%llu\n",
@@ -2693,6 +2954,12 @@ static void execFP(uint32_t inst, state_t *s) {
     default:
       UNREACHABLE();
     }
+  {
+    static const bool g_cosim = getenv("FP_COSIM") != nullptr;
+    if(g_cosim) {
+      fp_cosim_check<T,op>(s, _fs, _ft, _fd);
+    }
+  }
   {
     static const bool g_fpall = getenv("FPALLLOG") != nullptr;
     if(g_fpall && globals::asidpc_armed && (uint32_t)s->pc < 0x80000000u)
@@ -2849,12 +3116,24 @@ static void execCoproc1(uint32_t inst, state_t *s) {
 	    _fp2int(inst, s, false, FE_DOWNWARD);
 	    break;
 	  case 0x11:
+	    if(!globals::cpu_r5000) {
+	      take_exception_fpe(s);   /* MIPS IV: Unimplemented Operation on the R4400 */
+	      break;
+	    }
 	    _fmovc(inst, s);
 	    break;
 	  case 0x12:
+	    if(!globals::cpu_r5000) {
+	      take_exception_fpe(s);
+	      break;
+	    }
 	    _fmovz(inst, s);
 	    break;
 	  case 0x13:
+	    if(!globals::cpu_r5000) {
+	      take_exception_fpe(s);
+	      break;
+	    }
 	    _fmovn(inst, s);
 	    break;
 	  case 0x15:
@@ -2974,6 +3253,193 @@ void execMips(state_t *s) {
       memcpy(pg, s->gpr, sizeof(pg)); ppc=(uint32_t)s->pc; picnt=s->icnt; ph=true;
     } else ph=false;
   }
+  /* NANWATCH=<count>: find where a NaN is BORN in the FP register file.
+   * Follows the RETLOG idiom -- the FP file is snapshotted before the current
+   * instruction runs and compared at the top of the NEXT call, so the culprit
+   * is always the PREVIOUS instruction (whose result is now visible).
+   *
+   * We watch ALL 32 registers rather than just an FP arith destination on
+   * purpose: the ISS traps every div/sqrt to the IRIX emulator, so a bad
+   * emulated result re-enters the FP file through a context RESTORE (ldc1 /
+   * dmtc1 in kernel mode), not through an arithmetic op.  An arith-only
+   * detector would miss exactly the case we most suspect.
+   *
+   * A register that was ALREADY NaN is ignored -- propagation is not birth.
+   * Format comes from cpr1_state[]; `unknown` is read as double (the FP codes
+   * under test -- turb3d/apsi/hydro2d -- are double precision).
+   * NANWATCH_MINICNT skips the boot so daemons//etc/init noise is suppressed. */
+  { /* periodic FP-trap census: the process may be killed rather than exit
+     * cleanly, and on a long soak we want the trend, not just a final total. */
+    static const uint64_t g_ftc = getenv("FPTRAPCOUNT") ? strtoull(getenv("FPTRAPCOUNT"),0,0) : 0;
+    if(g_ftc > 1 && (s->icnt % g_ftc) == 0) {
+      uint64_t tot = 0;
+      for(int i = 0; i < 8; i++) {
+        tot += g_fptrap[i];
+      }
+      fprintf(stderr, "[fptrap] icnt=%llu total=%llu", (unsigned long long)s->icnt,
+              (unsigned long long)tot);
+      for(int i = 0; i < 8; i++) {
+        if(g_fptrap[i]) {
+          fprintf(stderr, " %s=%llu", g_fptrap_name[i], (unsigned long long)g_fptrap[i]);
+        }
+      }
+      fprintf(stderr, "\n");
+    }
+  }
+  { static const uint64_t g_nanwatch = getenv("NANWATCH") ? strtoull(getenv("NANWATCH"),0,0) : 0;
+    static const uint64_t g_nw_min = getenv("NANWATCH_MINICNT") ? strtoull(getenv("NANWATCH_MINICNT"),0,0) : 0;
+    if(g_nanwatch && s->icnt >= g_nw_min) {
+      static uint64_t pf[32]; static uint8_t pdbl_v[32];
+      static uint32_t ppc = 0, pinst = 0; static uint64_t picnt = 0;
+      static bool ph = false; static uint64_t nfired = 0, nconsumed = 0;
+      static nan_taint_t g_pend_taint; static int g_pend_reg = -1; static bool g_pend_dbl = false;
+      if(g_pend_reg >= 0) {
+        /* The previous instruction's result is now visible: keep the tag only if
+         * it actually produced a NaN, otherwise the value is clean. */
+        g_ftaint[g_pend_reg] = fp_is_nan(s->cpr1[g_pend_reg], g_pend_dbl) ? g_pend_taint : nan_taint_t();
+        g_pend_reg = -1;
+      }
+      if(ph && nfired < g_nanwatch) {
+        for(int k = 0; k < 32; k++) {
+          bool dbl = (s->cpr1_state[k] != fp_reg_state::sp);
+          if(!fp_is_nan(s->cpr1[k], dbl)) {
+            continue;
+          }
+          if(fp_is_nan(pf[k], pdbl_v[k] != 0)) {
+            continue;   /* already NaN before: propagation, not birth */
+          }
+          /* Classify the culprit.  IRIX's bcopy moves 8 bytes at a time with
+           * ldc1/sdc1, so a naive "this register became NaN" test trips
+           * constantly on USER-mode FP loads of pointer-ish stack data -- that
+           * is NaN-SHAPED DATA, not a NaN.  Keep only the two meaningful cases:
+           *   ARITH  -- a COP1 arithmetic op produced it (a real IEEE invalid)
+           *   KERNEL -- a kernel-mode FP write produced it, i.e. the FP emulator
+           *             or a context restore, which is the path a trapped
+           *             div.d/sqrt.d takes and our prime suspect.
+           * A user-mode FP load/move is dropped as data movement. */
+          uint32_t sr = s->cpr0[CPR0_SR];
+          bool kmode = ((sr & 0x6) != 0) || (((sr >> 3) & 3) == 0);   /* EXL|ERL set, or KSU==kernel */
+          uint32_t pfmt = (pinst >> 21) & 31;
+          uint32_t pfn  = pinst & 0x3f;
+          bool is_arith = ((pinst >> 26) == 0x11) && (pfmt == 16 || pfmt == 17) &&
+                          (pfn <= 7) && (pfn != 6);
+          if(!is_arith) {
+            continue;   /* non-arith writes are reported via the USE line's ORIGIN */
+          }
+          nfired++;
+          fprintf(stderr, "[nanwatch] #%llu %s NaN born in f%d: icnt=%llu pc=%08x inst=%08x %s\n",
+                  (unsigned long long)nfired, is_arith ? "ARITH" : "KERNEL", k,
+                  (unsigned long long)picnt, ppc, pinst,
+                  getAsmString(pinst, ppc).c_str());
+          fprintf(stderr, "[nanwatch]     f%d: %016llx -> %016llx (%s)\n", k,
+                  (unsigned long long)pf[k], (unsigned long long)s->cpr1[k], dbl ? "d" : "s");
+          /* For an arith culprit print its operands as they stood BEFORE it
+           * executed -- that is the "what generated the NaN" answer. */
+          if(is_arith) {
+            bool adbl = (pfmt == 17);
+            uint32_t fs = (pinst >> 11) & 31, ft = (pinst >> 16) & 31;
+            fprintf(stderr, "[nanwatch]     operands fs=f%u %016llx (%.17g)  ft=f%u %016llx (%.17g)\n",
+                    fs, (unsigned long long)pf[fs], fp_as_double(pf[fs], adbl),
+                    ft, (unsigned long long)pf[ft], fp_as_double(pf[ft], adbl));
+          }
+          fprintf(stderr, "[nanwatch]     sr=%08x cause=%08x epc=%08x fcsr=%08x kernel=%d\n",
+                  sr, s->cpr0[CPR0_CAUSE], s->cpr0[CPR0_EPC], s->fcr1[CP1_CR31], kmode ? 1 : 0);
+        }
+      }
+      /* Taint propagation + reporting, done BEFORE the instruction executes so
+       * the source values and the effective address are the architectural ones. */
+      uint32_t op6 = inst >> 26;
+      if(op6 == 0x11 || op6 == 0x31 || op6 == 0x35 || op6 == 0x39 || op6 == 0x3d) {
+        uint32_t cfmt = (inst >> 21) & 31;
+        uint32_t cfn  = inst & 0x3f;
+        uint32_t cfs  = (inst >> 11) & 31;
+        uint32_t cft  = (inst >> 16) & 31;
+        uint32_t cfd  = (inst >> 6)  & 31;
+        bool cdbl     = (cfmt == 17);
+        if(op6 == 0x11 && (cfmt == 16 || cfmt == 17)) {
+          bool two_src  = (cfn <= 3) || (cfn >= 0x30);
+          bool consumer = (cfn <= 7 && cfn != 6) || (cfn >= 0x20 && cfn <= 0x25) || (cfn >= 0x30);
+          if(consumer) {
+            /* Report the first arithmetic USE of a NaN, naming its ORIGIN. */
+            for(int w = 0; w < (two_src ? 2 : 1); w++) {
+              uint32_t rg = (w == 0) ? cfs : cft;
+              if(!fp_is_nan(s->cpr1[rg], cdbl) || nconsumed >= g_nanwatch) {
+                continue;
+              }
+              nconsumed++;
+              const nan_taint_t &t = g_ftaint[rg];
+              fprintf(stderr, "[nanwatch] USE#%llu f%u=%016llx read by icnt=%llu pc=%08x inst=%08x\n",
+                      (unsigned long long)nconsumed, rg, (unsigned long long)s->cpr1[rg],
+                      (unsigned long long)s->icnt, (uint32_t)s->pc, inst);
+              fprintf(stderr, "[nanwatch]     ORIGIN %s icnt=%llu pc=%08x inst=%08x va=%016llx\n",
+                      nan_kind_name(t.kind), (unsigned long long)t.icnt, t.pc, t.inst,
+                      (unsigned long long)t.addr);
+              fprintf(stderr, "[nanwatch]     sr=%08x cause=%08x epc=%08x fcsr=%08x\n",
+                      s->cpr0[CPR0_SR], s->cpr0[CPR0_CAUSE], s->cpr0[CPR0_EPC], s->fcr1[CP1_CR31]);
+              break;
+            }
+            /* Result taint: inherit from a NaN source (keep the ROOT), else a
+             * fresh ARITH birth if this op is about to manufacture one. */
+            nan_taint_t inh; inh.kind = 0;
+            for(int w = 0; w < (two_src ? 2 : 1); w++) {
+              uint32_t rg = (w == 0) ? cfs : cft;
+              if(fp_is_nan(s->cpr1[rg], cdbl) && g_ftaint[rg].kind != 0) {
+                inh = g_ftaint[rg]; break;
+              }
+            }
+            if(inh.kind == 0) {
+              inh.icnt = s->icnt; inh.pc = (uint32_t)s->pc; inh.inst = inst; inh.kind = 1;
+            }
+            if(cfn < 0x30) {   /* compares write a cc, not an FP register */
+              g_pend_taint = inh; g_pend_reg = (int)cfd; g_pend_dbl = cdbl;
+            }
+          }
+          else if(cfn == 6) {   /* mov.fmt: a pure copy, carry the tag */
+            g_pend_taint = g_ftaint[cfs]; g_pend_reg = (int)cfd; g_pend_dbl = cdbl;
+          }
+        }
+        else if(op6 == 0x11 && (cfmt == 4 || cfmt == 5)) {   /* mtc1 / dmtc1 */
+          nan_taint_t t; t.icnt = s->icnt; t.pc = (uint32_t)s->pc; t.inst = inst; t.kind = 2;
+          g_pend_taint = t; g_pend_reg = (int)cfs; g_pend_dbl = (cfmt == 5);
+        }
+        else if(op6 == 0x31 || op6 == 0x35) {   /* lwc1 / ldc1 -- inherit through memory */
+          uint64_t ea = (uint64_t)(s->gpr[(inst >> 21) & 31] + (int32_t)(int16_t)(inst & 0xffff));
+          nan_taint_t t; t.kind = 0;
+          if(!g_mtaint.empty()) {
+            auto it = g_mtaint.find(ea);
+            if(it != g_mtaint.end()) { t = it->second; }
+          }
+          if(t.kind == 0) {   /* no FP store we saw wrote this: EXTERN if it is a NaN */
+            t.icnt = s->icnt; t.pc = (uint32_t)s->pc; t.inst = inst; t.kind = 2; t.addr = ea;
+          }
+          g_pend_taint = t; g_pend_reg = (int)cft; g_pend_dbl = (op6 == 0x35);
+        }
+        else if(op6 == 0x39 || op6 == 0x3d) {   /* swc1 / sdc1 -- carry the tag into memory */
+          uint64_t ea = (uint64_t)(s->gpr[(inst >> 21) & 31] + (int32_t)(int16_t)(inst & 0xffff));
+          bool sdbl = (op6 == 0x3d);
+          if(fp_is_nan(s->cpr1[cft], sdbl)) {
+            g_mtaint[ea] = g_ftaint[cft];
+          }
+          else if(!g_mtaint.empty()) {
+            g_mtaint.erase(ea);
+          }
+        }
+      }
+      /* Only snapshot around instructions that can ARCHITECTURALLY write an FP
+       * register -- COP1/COP1X arith+moves and the FP loads.  Everything else
+       * cannot change cpr1[], so scanning after it is wasted work (this keeps
+       * the probe off the hot path of an otherwise integer instruction mix). */
+      uint32_t pop = inst >> 26;
+      ph = (pop == 0x11) || (pop == 0x13) || (pop == 0x31) || (pop == 0x35);
+      if(ph) {
+        for(int k = 0; k < 32; k++) {
+          pdbl_v[k] = (s->cpr1_state[k] != fp_reg_state::sp) ? 1 : 0;
+        }
+        memcpy(pf, s->cpr1, sizeof(pf));
+        ppc = (uint32_t)s->pc; pinst = inst; picnt = s->icnt;
+      }
+    }
+  }
   { /* PCHASH: rolling FNV-1a over the retired-PC stream, checkpoint every 65536.
      * Compared against henry_tb's identical hash to find the first RTL/ISS PC
      * divergence (expected only once interrupts skew the streams). */
@@ -2997,10 +3463,23 @@ void execMips(state_t *s) {
     /* optional TRACEWIN=lo:hi icnt window so a huge boot can emit a small,
      * focused retire_trace (e.g. around a single XTLB refill) for mips-analyzer. */
     static bool tw_init = false; static uint64_t tw_lo = 0, tw_hi = ~0ULL, tw_cap = 0, tw_ring = 0;
-    static bool tw_useronly = false, tw_trig_user = false, tw_armed = false;
+    static bool tw_useronly = false, tw_kernonly = false, tw_trig_user = false, tw_armed = false;
+    static uint32_t tw_freeze_pc = 0;
+    static uint64_t tw_freeze_n = 1, tw_freeze_hits = 0;
+    static uint32_t tw_pc_lo = 0, tw_pc_hi = 0;
     if(!tw_init) { tw_init = true; const char *tw = getenv("TRACEWIN");
                    if(tw) sscanf(tw, "%lu:%lu", &tw_lo, &tw_hi);
                    tw_useronly = getenv("TRACEWIN_USERONLY") != nullptr;
+                   tw_kernonly = getenv("TRACEWIN_KERNELONLY") != nullptr;   // pc >= 0x80000000 only: a
+                                                                             // ring of the net STACK, not
+                                                                             // the user loop between packets
+                   { const char *fp = getenv("TRACEWIN_FREEZE_PC");
+                     if(fp) tw_freeze_pc = strtoul(fp, nullptr, 0);
+                     const char *fn = getenv("TRACEWIN_FREEZE_N");
+                     if(fn) tw_freeze_n = strtoull(fn, nullptr, 0);
+                     const char *pl = getenv("TRACEWIN_PC_LO"), *ph = getenv("TRACEWIN_PC_HI");
+                     if(pl) tw_pc_lo = strtoul(pl, nullptr, 0);
+                     if(ph) tw_pc_hi = strtoul(ph, nullptr, 0); }
                    tw_trig_user = getenv("TRACEWIN_TRIG_USER") != nullptr;      // arm on first o32 entry
                    if(getenv("TRACEWIN_N")) tw_cap = strtoull(getenv("TRACEWIN_N"),0,0);
                    if(getenv("TRACEWIN_RING")) tw_ring = strtoull(getenv("TRACEWIN_RING"),0,0);  // keep LAST N
@@ -3010,12 +3489,24 @@ void execMips(state_t *s) {
     if(tw_trig_user && !tw_armed && (uint32_t)s->pc < 0x80000000u) tw_armed = true;
     if(!g_ring_frozen && s->icnt >= tw_lo && s->icnt < tw_hi && (!tw_trig_user || tw_armed)
        && (tw_ring != 0 || tw_cap == 0 || globals::retire_log->get_records().size() < tw_cap)
-       && !(tw_useronly && (uint32_t)s->pc >= 0x80000000u)) {
+       && !(tw_useronly && (uint32_t)s->pc >= 0x80000000u)
+       && !(tw_kernonly && (uint32_t)s->pc <  0x80000000u)
+       && !(tw_pc_hi && ((uint32_t)s->pc < tw_pc_lo || (uint32_t)s->pc >= tw_pc_hi))) {
       auto &recs = globals::retire_log->get_records();
       recs.emplace_back(ipa, (uint64_t)s->pc, inst);
       /* TRACEWIN_RING=N: keep only the last N records (trace the run-up to a crash,
        * regardless of exact icnt). std::list pop_front is O(1). */
       if(tw_ring != 0 && recs.size() > tw_ring) recs.pop_front();
+      if(tw_freeze_pc && (uint32_t)s->pc == tw_freeze_pc && tw_ring != 0 && recs.size() >= tw_ring
+         && (++tw_freeze_hits >= tw_freeze_n)) {
+        g_ring_frozen = true;
+        /* Force a CLEAN exit ~1 insn later so main() serializes the trace (a kill -9
+         * would discard it -- the boost archive is written only at normal exit). The
+         * ring is already frozen, so the trailing insns don't pollute it. */
+        s->maxicnt = s->icnt + 1;
+        fprintf(stderr, "[tracewin] froze ring at pc=%08x icnt=%llu (exiting to flush)\n",
+                tw_freeze_pc, (unsigned long long)s->icnt);
+      }
     }
   }
   /* ASIDPC=<file>: per USERSPACE retire, dump (asid<<32 | vpc) as an 8-byte LE record.
@@ -3032,142 +3523,25 @@ void execMips(state_t *s) {
     if(globals::pctrace_on && !(useronly && (uint32_t)s->pc >= 0x80000000u))
       fprintf(globals::pctrace, "%08x\n", (uint32_t)s->pc);
   }
-  /* TEMP: at resumeidle+0x30 (0x88003568, just after `lw sp,-24156(zero)`), dump the
-   * idle sp the ISS loads + the source global mem[0xFFFFA164]. FPGA got 0x8834afb8. */
-  if((uint32_t)s->pc==0x88002200u){
-    static int hc=0;
-    if(hc++ < 8){
-      uint32_t sp=(uint32_t)s->gpr[29];
-      uint64_t va=(uint64_t)(int64_t)(-24156); uint32_t pa=va_translate(s, va, tlb_op::load);
-      uint32_t g=__builtin_bswap32(s->mem.get<uint32_t>(pa));
-      fprintf(stderr,"[GLOB%d] icnt=%llu mem[0xFFFFA164] pa=%08x val=%08x (idle sp global; FPGA loaded 0x8834afb8)\n",hc,(unsigned long long)s->icnt,pa,g);
-    }
-  }
-  {
-    /* CALLWIN=lo:hi -- log every jal/jalr (caller pc -> callee target) in the
-     * icnt window, for diffing the kernel call sequence against MAME. */
-    static const char *cw = getenv("CALLWIN");
-    static uint64_t cwlo = 0, cwhi = 0; static bool cwp = false;
-    if(cw && !cwp) { sscanf(cw, "%llu:%llu", (unsigned long long*)&cwlo, (unsigned long long*)&cwhi); cwp = true; }
-    if(cw && s->icnt >= cwlo && s->icnt < cwhi) {
-      uint32_t op = inst >> 26;
-      if(op == 3) /* jal */
-        fprintf(stderr, "[call] %lu %08x %08x\n", (unsigned long)s->icnt,
-                (uint32_t)s->pc, (uint32_t)((s->pc & ~0xfffffffULL) | ((uint64_t)(inst & 0x3ffffff) << 2)));
-      else if(op == 0 && (inst & 0x3f) == 9) /* jalr */
-        fprintf(stderr, "[call] %lu %08x %08x\n", (unsigned long)s->icnt,
-                (uint32_t)s->pc, (uint32_t)s->gpr[(inst >> 21) & 31]);
-    }
-  }
-  static const bool romvec_dbg = getenv("ROMVEC") != nullptr;
-  if(romvec_dbg) {
-    /* Log every control transfer into the ARCS romvec stub blob (PA 0x1000..
-     * 0x1fff) -- jal/jalr/j/jr -- with args, so we can ask MAME what the real
-     * PROM returns for each. (call_prom uses jr tail-calls, not just jalr.) */
-    uint32_t op = inst >> 26, fn = inst & 0x3f, tgt = 0;
-    bool xfer = false;
-    if(op == 2 || op == 3) { tgt = (uint32_t)((s->pc & ~0xfffffffULL) | ((uint64_t)(inst & 0x3ffffff) << 2)); xfer = true; }
-    else if(op == 0 && (fn == 8 || fn == 9)) { tgt = (uint32_t)s->gpr[(inst >> 21) & 31]; xfer = true; }
-    if(xfer && (tgt & 0x1fffffff) >= 0x1000 && (tgt & 0x1fffffff) < 0x2000)
-      fprintf(stderr, "[romvec] icnt=%lu caller=%08x target=%08x a0=%016lx a1=%016lx a2=%016lx a3=%016lx ra=%08x\n",
-              (unsigned long)s->icnt, (uint32_t)s->pc, tgt,
-              (long)s->gpr[4], (long)s->gpr[5], (long)s->gpr[6], (long)s->gpr[7], (uint32_t)s->gpr[31]);
-  }
-  static const bool kmissdbg = getenv("KMISSDBG") != nullptr;
-  if((uint32_t)s->pc == 0x880162c8u && kmissdbg) {
-    /* kmiss entry: for a fault in the KPTEBASE self-map region [0xff800000,
-     * 0xffa00000), replicate the handler's PDA walk and dump whether the
-     * page-table-of-page-table root is backed. PDA base ptr lives at kseg3
-     * 0xffffa014; +0x378/+0x37c = two PT roots; +0x380 = entry limit. A zero
-     * entry0/entry1 here is exactly the "0xff800000 never gets backed" panic. */
-    uint32_t bv = (uint32_t)s->cpr0[CPR0_BADVADDR];
-    static int n = 0;
-    if(bv >= 0xff800000u && bv < 0xffa00000u && n++ < 8) {
-      auto rd32 = [&](uint64_t va, bool &ok) -> uint32_t {
-        uint32_t pa;
-        if(tlb_probe_ro(s, va, &pa)) { ok = true; return bswap<EL>(s->mem.get<uint32_t>(pa)); }
-        ok = false; return 0;
-      };
-      bool ok_pcb, ok_lim, ok_b0, ok_b1, ok_e0, ok_e1;
-      uint32_t idx = (bv - 0xff800000u) >> 12;
-      uint32_t pcb   = rd32(0xffffffffffffa014ULL, ok_pcb);   /* PDA base ptr  */
-      uint32_t lim   = rd32((uint64_t)(int64_t)(int32_t)(pcb + 0x380), ok_lim);
-      uint32_t base0 = rd32((uint64_t)(int64_t)(int32_t)(pcb + 0x378), ok_b0);
-      uint32_t base1 = rd32((uint64_t)(int64_t)(int32_t)(pcb + 0x37c), ok_b1);
-      uint32_t e0    = rd32((uint64_t)(int64_t)(int32_t)(base0 + idx*4), ok_e0);
-      uint32_t e1    = rd32((uint64_t)(int64_t)(int32_t)(base1 + idx*4), ok_e1);
-      bool ok_kpt, ok_klim;
-      uint32_t kptbl = rd32(0xffffffff8832cf58ULL, ok_kpt);   /* global kernel PT base */
-      uint32_t klim  = rd32(0xffffffff8832b588ULL, ok_klim);  /* kmissnxt limit */
-      fprintf(stderr, "[kmiss] icnt=%lu bva=%08x idx=%u pcb=%08x(%d) lim=%08x(%d) "
-              "base0=%08x(%d) e0=%08x(%d) base1=%08x(%d) e1=%08x(%d) "
-              "kptbl=%08x(%d) klim=%08x(%d)\n",
-              (unsigned long)s->icnt, bv, idx, pcb, ok_pcb, lim, ok_lim,
-              base0, ok_b0, e0, ok_e0, base1, ok_b1, e1, ok_e1,
-              kptbl, ok_kpt, klim, ok_klim);
-    }
-  }
-  if((uint32_t)s->pc == 0x880052a4u && kmissdbg) {   /* resume entry */
-    static unsigned long rc = 0;
-    if(rc < 4 || (rc % 1000) == 0)
-      fprintf(stderr, "[resume] #%lu icnt=%lu a0(thread)=%08x\n",
-              rc, (unsigned long)s->icnt, (uint32_t)s->gpr[4]);
-    rc++;
-  }
-  {
-    /* KMISSTRACE: once the c0000000 bzero fires, log every TLB-handler entry so we
-     * can see the routing for the 0xffb00000 page-table-region fault — does it reach
-     * kmissnxt (global) or fall into kmiss's per-process longway? */
-    static const bool kt = getenv("KMISSTRACE") != nullptr;
-    static bool armed = false;
-    if(kt) {
-      if((uint32_t)s->pc == 0x8801a860u && (uint32_t)s->gpr[4] == 0xc0000000u) armed = true;
-      if(armed) {
-        uint32_t pc = (uint32_t)s->pc;
-        const char *nm = pc==0x80000000u ? "refill_vec" : pc==0x80000180u ? "general_vec"
-                       : pc==0x880162c8u ? "kmiss"      : pc==0x880164fcu ? "kmissnxt"
-                       : pc==0x880165d4u ? "kmissnxt_c0" : pc==0x88015c10u ? "longway"
-                       : pc==0x88016498u ? "kmiss_pathB" : nullptr;
-        if(nm)
-          fprintf(stderr, "[ktrace] icnt=%lu %-11s pc=%08x bva=%08x ctx=%08x exl=%d epc=%08x\n",
-                  (unsigned long)s->icnt, nm, pc, s->cpr0[CPR0_BADVADDR], s->cpr0[CPR0_CONTEXT],
-                  (s->cpr0[CPR0_SR] & SR_EXL) ? 1 : 0, s->cpr0[CPR0_EPC]);
-      }
-    }
-  }
-  static const bool kvaldbg = getenv("KVALDBG") != nullptr;
-  if(kvaldbg) {
-    /* kvalloc PTE-write loop: 0x880fd07c = `sw a3,-4(s0)` (kvalloc+0x2dc), the PC
-     * MAME says writes the VALID leaf PTE into kptbl[c0000000] @ PA 0x08392000
-     * (value 0x4020f61f) before the bzero. s0=$16 (post-incr -> slot is s0-4),
-     * a3=$7 (PTE value). We log writes landing in the kptbl arena, plus read back
-     * kptbl[c0000000] at the bzero fault (pc 0x8801a860) for direct comparison. */
-    if((uint32_t)s->pc == 0x880fd07cu) {
-      static unsigned long wn = 0;
-      uint32_t va  = (uint32_t)s->gpr[16] - 4;     /* s0 - 4 */
-      uint32_t pa  = va & 0x1fffffffu;             /* s0 is kseg0 */
-      uint32_t val = (uint32_t)s->gpr[7];          /* a3 = PTE */
-      bool in_arena = (pa >= 0x08392000u && pa < 0x08393000u);
-      if(wn < 4 || in_arena)
-        fprintf(stderr, "[kval] #%lu icnt=%lu pc=880fd07c va=%08x pa=%08x val=%08x%s\n",
-                wn, (unsigned long)s->icnt, va, pa, val,
-                pa == 0x08392000u ? "  <== kptbl[c0000000]" : "");
-      wn++;
-    }
-    if((uint32_t)s->pc == 0x8801a860u && (uint32_t)s->gpr[4] == 0xc0000000u) {
-      static int once = 0;                          /* the c0000000 bzero store */
-      if(once++ < 2)
-        fprintf(stderr, "[kval] bzero(c0000000)@8801a860 icnt=%lu kptbl[c0000000]@pa08392000=%08x\n",
-                (unsigned long)s->icnt,
-                bswap<EL>(s->mem.get<uint32_t>(0x08392000u)));
-    }
-  }
-
+ 
+  
+  
   /* 64-bit ops raise Reserved Instruction when not in 64-bit mode (matches the
    * RTL decode_mips.sv gate; the random instruction tests rely on this). */
   if(is_64b_gated(inst) && !in_64b_mode(s)) {
     take_exception_ri(s);
     return;
+  }
+
+  /* MIPS IV integer ops (movf/movt, movz/movn) and the whole COP1X opcode are
+   * reserved on the R4400 (MIPS III) and in r9999's decode: RI unless --cpu r5000.
+   * pref (0x33) stays a no-op on both, matching decode_mips.sv. */
+  if(!globals::cpu_r5000) {
+    uint32_t op = inst >> 26, fn = inst & 0x3fu;
+    if((op == 0x13) || ((op == 0) && (fn == 0x01 || fn == 0x0a || fn == 0x0b))) {
+      raise_ri(s, inst);
+      return;
+    }
   }
 
   /* CP1 Coprocessor-Unusable: a CP1/FP op with Status.CU1==0 raises CpU (CE=1),
@@ -3177,7 +3551,7 @@ void execMips(state_t *s) {
    * FP use.  Previously interp_mips ignored CU1, building FP bookkeeping inconsistent
    * with CU1-enforcing HW -- which derailed checkpoint resume onto the RTL. */
   { uint32_t op = inst >> 26;
-    if((op == 0x11 || op == 0x31 || op == 0x35 || op == 0x39 || op == 0x3d)
+    if((op == 0x11 || op == 0x13 || op == 0x31 || op == 0x35 || op == 0x39 || op == 0x3d)
        && !(s->cpr0[CPR0_SR] & SR_CU1)) {
       take_exception_cpu(s, 1);
       return;
@@ -3612,7 +3986,10 @@ void execMips(state_t *s) {
 	    s->tlb[idx].page_mask = s->cpr0[CPR0_PAGEMASK];
 	    if(idx==0 && getenv("TLBTALLY")) { static uint64_t pv=~0ull; uint64_t c=s->tlb[0].entry_lo1;
 	      if(c!=pv){ fprintf(stderr,"[iss-idx0-wr] hi=%llx lo0=%llx lo1=%llx v1=%d icnt=%lu\n",(unsigned long long)s->tlb[0].entry_hi,(unsigned long long)s->tlb[0].entry_lo0,(unsigned long long)c,(int)((c>>1)&1),(unsigned long)s->icnt); pv=c; } }
-	    assert(s->tlb[idx].page_mask == 0);
+	    assert(valid_page_mask(s->tlb[idx].page_mask));
+	    if(g_tlbpm_on) {
+	      tlbpm_count(s->tlb[idx].entry_hi, s->tlb[idx].page_mask);
+	    }
 	    iss_tlbdup_check(s, idx, "tlbwi");
 	  }
 	  utlb_flush();   /* mapping changed -> drop the micro-TLB */
@@ -3630,7 +4007,10 @@ void execMips(state_t *s) {
 	    s->tlb[idx].entry_lo0 = s->cpr0_64[CPR0_ENTRYLO0];
 	    s->tlb[idx].entry_lo1 = s->cpr0_64[CPR0_ENTRYLO1];
 	    s->tlb[idx].page_mask = s->cpr0[CPR0_PAGEMASK];
-	    assert(s->tlb[idx].page_mask == 0);
+	    assert(valid_page_mask(s->tlb[idx].page_mask));
+	    if(g_tlbpm_on) {
+	      tlbpm_count(s->tlb[idx].entry_hi, s->tlb[idx].page_mask);
+	    }
 	    iss_tlbdup_check(s, idx, "tlbwr");
 	  }
 	  utlb_flush();   /* mapping changed -> drop the micro-TLB */
@@ -3752,6 +4132,17 @@ void execMips(state_t *s) {
 	  ptetrack_probe(s, rd, rt);
 	  if(rd == CPR0_COMPARE) { /* writing Compare re-arms + clears the timer interrupt (IP[7]) */
 	    s->cpr0[CPR0_CAUSE] &= ~(1u << 15);
+	    /* TICKPROBE=1: report each Compare arm so the actual IRIX tick period
+	     * (in CP0 Count units) can be measured rather than assumed. */
+	    { static const bool g_tp = getenv("TICKPROBE") != nullptr;
+	      if(g_tp) {
+	        static uint32_t last_arm = 0; static unsigned n = 0;
+	        uint32_t cnt = s->cpr0[CPR0_COUNT];
+	        uint32_t iv  = s->cpr0[CPR0_COMPARE] - cnt;
+	        fprintf(stderr, "[tick] n=%u count=%u compare=%u interval=%u delta_since_last_arm=%u pc=%08x\n",
+	                n++, cnt, s->cpr0[CPR0_COMPARE], iv, cnt - last_arm, (uint32_t)s->pc);
+	        last_arm = cnt;
+	      } }
 	    /* EXPERIMENT (env TIMER_SCALE=N): stretch each timer period N-fold by
 	     * scaling the just-written interval (Compare-Count), leaving Count itself
 	     * untouched so clock calibration (get_r4k_counter) still reads sanely.
@@ -3802,6 +4193,7 @@ void execMips(state_t *s) {
 	  /* CP0 reg 7 is the simulator putchar port */
 	  if(rd == 7 && !s->silent) {
 	    fputc((int)(s->gpr[rt] & 0xff), stdout);
+	    console_watch(s, (char)(s->gpr[rt] & 0xff));
 	    fflush(stdout);
 	  }
 	  HISTO(s, mipsInsn::MTC0);
@@ -3814,6 +4206,7 @@ void execMips(state_t *s) {
 	  ptetrack_probe(s, rd, rt);
 	  if(rd == 7 && !s->silent) {
 	    fputc((int)(s->gpr[rt] & 0xff), stdout);
+	    console_watch(s, (char)(s->gpr[rt] & 0xff));
 	    fflush(stdout);
 	  }
 	  HISTO(s, mipsInsn::DMTC0);
@@ -3872,11 +4265,20 @@ void execMips(state_t *s) {
       case 0x07:
 	branch<EL,branch_type::bgtz>(inst, s); 
 	break;
-      case 0x08: /* addi */
-	s->gpr[rt] = s->gpr[rs] + simm32;  
+      case 0x08: { /* addi: 32-bit add, traps on signed 32-bit overflow */
+	uint32_t u_rs  = (uint32_t)s->gpr[rs];
+	uint32_t u_imm = (uint32_t)simm32;
+	uint32_t result = u_rs + u_imm;
+	/* same rule as add (0x20): same-sign inputs, different-sign result */
+	if (((result >> 31) != (u_imm >> 31)) && ((u_rs >> 31) == (u_imm >> 31))) {
+	  raise_overflow(s);
+	  break;
+	}
+	s->gpr[rt] = sext64(result);
 	s->pc+=4;
 	HISTO(s, mipsInsn::ADDI);
 	break;
+      }
       case 0x09: /* addiu: 32-bit add, result sign-extended (MIPS64) */
 	tmp = sext64((uint32_t)(s->gpr[rs] + simm32));
 	s->gpr[rt] = tmp;
@@ -4028,6 +4430,34 @@ void execMips(state_t *s) {
 		    (unsigned long long)s->icnt, (uint32_t)s->pc, cop,
 		    (unsigned long long)va, mapped ? dbgpa : (uint32_t)(va & 0x1fffffff),
 		    cache_model::set_of(mapped ? dbgpa : (uint32_t)(va & 0x1fffffff)));
+	  }
+	  { /* SCSIZE: emulate the SD tag ops for size_2nd_cache (Index_Store_Tag_SD at
+	     * index 0, then Index_Load_Tag_SD at 128K, 256K, ... until it reads back the
+	     * zero it stored = the index wrapped).  Tags are keyed by the SC index. */
+	    static const uint32_t g_scsize = getenv("SCSIZE") ? (uint32_t)strtoul(getenv("SCSIZE"), 0, 0) : 0;
+	    static std::unordered_map<uint32_t, uint32_t> g_sctag;
+	    uint32_t which = cop & 0x3, op = (cop >> 2) & 0x7;
+	    if(g_scsize && which == 3 && (op == 1 || op == 2)) {
+	      uint32_t idx = (uint32_t)(va & 0x1fffffffu) % g_scsize;
+	      if(op == 2) {
+		g_sctag[idx] = (uint32_t)s->cpr0[28];              /* Index_Store_Tag_SD <- TagLo */
+	      }
+	      else {
+		auto it = g_sctag.find(idx);                        /* Index_Load_Tag_SD -> TagLo */
+		uint32_t t = (it != g_sctag.end()) ? it->second : (0x80000000u | (uint32_t)(va & 0x1fffffffu) >> 4);
+		s->cpr0[28] = t;
+		s->cpr0_64[28] = t;
+	      }
+	    }
+	    if(sclog_file() && (which == 1 || which == 3)) {
+	      /* hit ops name a physical line; index ops an index (log va & 0x1fffffff) */
+	      uint32_t lpa = (uint32_t)(va & 0x1fffffffu);
+	      if(op >= 4) {
+		uint32_t tpa = 0;
+		lpa = tlb_probe_ro(s, va, &tpa) ? tpa : 0xffffffffu;
+	      }
+	      sclog(1, s->icnt, lpa, 0, (uint32_t)s->pc, (uint8_t)cop);
+	    }
 	  }
 	  if(g_cmodel) {
 	    uint32_t which   = cop & 0x3;         /* 0=I 1=D 2=SI 3=SD */

@@ -11,6 +11,9 @@
 #include <boost/program_options.hpp>
 
 #include "interpret.hh"
+#include "ws_profile.hh"
+#include "bbv.hh"
+#include "brtrace.hh"
 #include "loadelf.hh"
 #include "sparse_mem.hh"
 #include "pseudo_bios.hh"
@@ -52,15 +55,22 @@ namespace globals {
   uint32_t pctrace_start = 0x88005960u;
   bool pctrace_on = false;
   bool asidpc_armed = false;   /* SIGUSR1 toggles; gates the ASIDPC userspace dump */
+  bool cpu_r5000 = false;
 };
 static state_t *s = nullptr;
 
 int main(int argc, char *argv[]) {
   std::string filename, arcs, retire_name, start_pc, disk, prom, disk_delta, ckpt_at, ckpt_out, restore_name;
   std::string cosim;   /* "server"|"client": lockstep co-sim vs the JIT sim */
+  std::string cpu;
   bool disk_write = false;   /* --disk-write: write straight through to --disk (no COW) */
   uint64_t maxinsns = ~(0UL);
   uint64_t ckpt_icnt = 0;
+  uint64_t ckpt_every = 0, ckpt_start = 0;
+  bool virt = false;
+  uint64_t bbv_interval = 0;
+  std::string bbv_out;
+  std::string brtrace_out;
   int gdb_port = 0;
   try {
     po::options_description desc("options");
@@ -76,14 +86,28 @@ int main(int argc, char *argv[]) {
       ("prom",     po::value<std::string>(&prom),     "flat PROM firmware blob loaded at phys 0x1fc00000 (e.g. henry_arcs.bin); use with --start-pc 0xbfc00000")
       ("checkpoint-at",  po::value<std::string>(&ckpt_at)->default_value(""),  "dump a full-state checkpoint when this PC (hex) first retires, then exit")
       ("checkpoint-icnt", po::value<uint64_t>(&ckpt_icnt)->default_value(0),    "dump a full-state checkpoint when icnt first reaches this value, then exit")
+      ("bbv-interval", po::value<uint64_t>(&bbv_interval)->default_value(0), "SimPoint basic-block vectors: one per N instructions (0 = off)")
+      ("bbv-out", po::value<std::string>(&bbv_out)->default_value("run.bbv"), "BBV output file (SimPoint .bb format)")
+      ("brtrace", po::value<std::string>(&brtrace_out), "oracle branch trace for r9999 ORACLE_BP: one record per retired control transfer (predecode.sv classes)")
+      ("virt", po::bool_switch(&virt), "r9999-virt device-free platform: flat RAM at PA 0 -- no IP22 memory alias, no device window")
+      ("checkpoint-every", po::value<uint64_t>(&ckpt_every)->default_value(0), "uniform sampling: dump a checkpoint every N instructions (to <checkpoint-out>.<icnt>) and keep running")
+      ("checkpoint-start", po::value<uint64_t>(&ckpt_start)->default_value(0), "with --checkpoint-every: first dump at this icnt (default N)")
       ("checkpoint-out", po::value<std::string>(&ckpt_out)->default_value("checkpoint.bin"), "checkpoint output file for --checkpoint-at")
       ("restore", po::value<std::string>(&restore_name)->default_value(""), "restore a full-state checkpoint (loadState) and continue from it")
       ("gdb", po::value<int>(&gdb_port)->default_value(0), "listen for gdb on this TCP port (RSP stub); boots full-speed until a client attaches")
-      ("cosim", po::value<std::string>(&cosim), "lockstep co-sim: 'server' (golden) or 'client'; run both sims with DETTIME=1");
+      ("cosim", po::value<std::string>(&cosim), "lockstep co-sim: 'server' (golden) or 'client'; run both sims with DETTIME=1")
+      ("cpu", po::value<std::string>(&cpu)->default_value("r4400"), "CPU model: r4400 (MIPS III, matches r9999) or r5000 (R5000PC Indy: MIPS IV, 32K+32K L1, no L2)");
     po::variables_map vm;
     po::store(po::parse_command_line(argc, argv, desc), vm);
     po::notify(vm);
   } catch(...) { std::cerr << "bad args\n"; return 1; }
+  if(cpu == "r5000") {
+    globals::cpu_r5000 = true;
+  }
+  else if(cpu != "r4400") {
+    std::cerr << "--cpu must be r4400 or r5000\n";
+    return 1;
+  }
 
   //if(filename.empty()) { std::cerr << "need --file <kernel>\n"; return 1; }
 
@@ -97,6 +121,10 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "[cache_model] ENABLED: 32B write-back L1 D-cache (%u sets)%s\n",
             cache_model::L1_SETS, g_stale_detect ? " + STALE_DETECT" : "");
   }
+  if(getenv("WSPROFILE")) {
+    g_wsprof = new ws_profile();
+    fprintf(stderr, "[ws_profile] ENABLED: data working-set curves (marker VA 0x30000000 reset / 0x30001000 dump)\n");
+  }
   s = new state_t(*sm);
   s->maxicnt = maxinsns;
   s->mc  = new sgi_mc(s);
@@ -105,7 +133,7 @@ int main(int argc, char *argv[]) {
   if(!disk.empty()) s->scsi = new sgi_scsi(s, disk, disk_delta, disk_write);
   s->seeq = new sgi_seeq(s);   /* Seeq 8003 ethernet; tap via env SEEQ_TAP=<ifname> */
   sm->st = s;
-  sm->route_devices = true;
+  sm->route_devices = !virt;   /* virt: no IP22 low-memory alias, no device window */
 
   initState(s);                    /* CP0 reset state: PRId, Config, SR, Random */
   if(not(filename.empty())) {
@@ -217,6 +245,7 @@ int main(int argc, char *argv[]) {
   uint64_t probe_after = a1after ? strtoull(a1after, nullptr, 0) : 0;
   int probe_hits = 0;
   uint32_t ckpt_pc = ckpt_at.empty() ? 0 : (uint32_t)strtoull(ckpt_at.c_str(), nullptr, 0);
+  uint64_t ckpt_next = ckpt_start ? ckpt_start : ckpt_every;
   /* PCTRACEOUT=<file>: co-sim trace -- one hex virtual PC per retired
    * instruction (delay slots included; emitted inside execMips), starting when
    * execution first reaches PCTRACE_START (default kernel entry 0x88005960). */
@@ -254,6 +283,8 @@ int main(int argc, char *argv[]) {
   }
 
   double t0 = timestamp();
+  bbv_log *bbv = bbv_interval ? new bbv_log(bbv_interval) : nullptr;
+  brtrace_log *brt = brtrace_out.empty() ? nullptr : new brtrace_log(brtrace_out.c_str());
   while(s->brk == 0 && s->icnt < s->maxicnt) {
     /* BECOUNT: tally userspace + be-region (0x0c-0x10M text/libc) dynamic instrs; print at the crash pc. */
     { static const bool g_bec = getenv("BECOUNT") != nullptr;
@@ -265,7 +296,7 @@ int main(int argc, char *argv[]) {
           fprintf(stderr,"[becount] crash pc=%08x sys_icnt=%lu | userspace=%lu | be_region(0c-10M)=%lu (first be icnt=%lu -> span=%lu)\n",
                   p,(unsigned long)s->icnt,(unsigned long)g_us,(unsigned long)g_be,
                   (unsigned long)g_be_first_icnt,(unsigned long)(s->icnt-g_be_first_icnt)); } }
-    if(g_sig_dumpproc)   { g_sig_dumpproc = 0;   dump_current_process(s);
+    if(g_sig_dumpproc)   { g_sig_dumpproc = 0;   dump_current_process(s);   tlbpm_report();
       globals::asidpc_armed = !globals::asidpc_armed;
       fprintf(stderr, "[asidpc] armed=%d icnt=%lu\n", globals::asidpc_armed, (unsigned long)s->icnt); }
     if(g_sig_flushdelta) { g_sig_flushdelta = 0; if(s->scsi) s->scsi->flush_delta(); }
@@ -287,12 +318,35 @@ int main(int argc, char *argv[]) {
      * and RTL but diverging from the original run), and NOT with a load-linked
      * armed (the RTL's llbit is not seeded, so a resumed SC would fail where
      * the interp expects success).  Defer to the next safe retire. */
-    bool ckpt_safe = !s->in_delay_slot && !s->ll_armed;
+    /* not in a delay slot, no LL armed, and not in exception mode: the restore shim
+     * ends with eret to the checkpoint PC, which cannot rebuild EXL/ERL + the
+     * handler's EPC (a sample inside the TLB-refill handler would lose it) */
+    /* WSSTART/WSSTOP: working-set profile window by instruction count (Linux runs
+     * have no VA-marker stores) */
+    { static const uint64_t g_wss = getenv("WSSTART") ? strtoull(getenv("WSSTART"), 0, 0) : 0;
+      static const uint64_t g_wse = getenv("WSSTOP") ? strtoull(getenv("WSSTOP"), 0, 0) : 0;
+      if(g_wsprof && g_wse) {
+        if(s->icnt == g_wss) {
+          g_wsprof->reset(s->icnt);
+          fprintf(stderr, "### WSRESET at icnt %llu\n", (unsigned long long)s->icnt);
+        }
+        else if(s->icnt == g_wse) {
+          g_wsprof->dump("window", s->icnt);
+        }
+      } }
+    bool ckpt_safe = !s->in_delay_slot && !s->ll_armed && !(s->cpr0[CPR0_SR] & (SR_EXL | SR_ERL));
     if(ckpt_pc && (uint32_t)s->pc == ckpt_pc && ckpt_safe) {
       fprintf(stderr, "[ckpt] reached pc=%08x at icnt=%lu -> dumping %s\n",
               ckpt_pc, (unsigned long)s->icnt, ckpt_out.c_str());
       dumpState(*s, ckpt_out);
       break;
+    }
+    if(ckpt_every && s->icnt >= ckpt_next && ckpt_safe) {
+      std::string f = ckpt_out + "." + std::to_string((unsigned long)s->icnt);
+      fprintf(stderr, "[ckpt] every: icnt=%lu (pc=%08x) -> %s\n",
+              (unsigned long)s->icnt, (uint32_t)s->pc, f.c_str());
+      dumpState(*s, f);
+      ckpt_next += ckpt_every;
     }
     if(ckpt_icnt && s->icnt >= ckpt_icnt && ckpt_safe) {
       fprintf(stderr, "[ckpt] reached icnt=%lu (pc=%08x) -> dumping %s\n",
@@ -331,7 +385,14 @@ int main(int argc, char *argv[]) {
         }
       }
     }
+    const uint64_t bbv_pc = (uint64_t)s->pc;
+    uint32_t brt_insn = 0;
+    if(brt && !guest_rd32_be(s, bbv_pc, &brt_insn)) {
+      brt_insn = 0;
+    }
     execMips(s);
+    if(bbv) { bbv->step(bbv_pc, (uint64_t)s->pc, s->icnt); }
+    if(brt) { brt->step(bbv_pc, brt_insn, (uint64_t)s->pc); }
     if(g_htrace) {   /* kernel TLB-Mod handler trace: executed pc + kernel scratch + arg regs */
       fprintf(stderr, "[HTRACE] pc=%08x k0=%016llx k1=%016llx a0=%016llx a1=%016llx a2=%016llx a3=%016llx cause=%02x epc=%08x sr=%08x\n",
               (uint32_t)valt_pc,
@@ -374,9 +435,19 @@ int main(int argc, char *argv[]) {
   if(s->scsi) s->scsi->flush_delta();   /* persist COW overlay on clean exit (no-op without --disk-delta) */
 
   if(globals::pctrace) fclose(globals::pctrace);
+  if(brt) {
+    std::cerr << "wrote " << brt->n << " branch records to " << brtrace_out << "\n";
+    delete brt;
+  }
+  if(bbv) {
+    bbv->dump(bbv_out);
+    std::cerr << "wrote basic-block vectors to " << bbv_out << "\n";
+    delete bbv;
+  }
   std::cout << "\n" << s->icnt << " instructions executed, brk=" << (int)s->brk << "\n";
   std::cout << (static_cast<double>(s->icnt) / t0)*1e-6 << " minsns/sec\n";
-  { extern void l1_alias_report(); l1_alias_report(); }   /* L1_ALIAS VIPT alias-freq sweep */
+
+  
   if(!retire_name.empty() && !rt.empty()) {
     std::ofstream ofs(retire_name, std::ios::binary);
     boost::archive::binary_oarchive oa(ofs);

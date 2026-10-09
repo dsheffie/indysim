@@ -223,20 +223,57 @@ sparse_mem::~sparse_mem() {
 
 
 
+
+/* Which physical regions actually fall through to the flat backing store -- i.e.
+ * what a strict device model (QEMU) would otherwise leave unmapped.  Real RAM
+ * (low_local) and its low alias are skipped.  Enable with UNCLAIMEDDBG=1. */
+static const bool unclaimed_log = getenv("UNCLAIMEDDBG") != nullptr;
+namespace {
+  struct unclaimed_tally {
+    struct ent { uint64_t loads = 0, stores = 0, lo = ~0ULL, hi = 0; };
+    std::map<mem_range_t, ent> m;
+    void note(mem_range_t r, uint64_t pa, bool store) {
+      if(r == mem_range_t::low_local || r == mem_range_t::sys_mem_alias) { return; }
+      ent &e = m[r];
+      if(store) { e.stores++; } else { e.loads++; }
+      if(pa < e.lo) { e.lo = pa; }
+      if(pa > e.hi) { e.hi = pa; }
+    }
+    ~unclaimed_tally() {
+      if(not unclaimed_log) { return; }
+      fprintf(stderr, "\n=== regions backed by the flat store (outside real RAM) ===\n");
+      for(const auto &kv : m) {
+        fprintf(stderr, "%-16s loads=%-12llu stores=%-12llu pa 0x%08llx..0x%08llx\n",
+                rangeNames.at(kv.first).c_str(),
+                (unsigned long long)kv.second.loads,
+                (unsigned long long)kv.second.stores,
+                (unsigned long long)kv.second.lo,
+                (unsigned long long)kv.second.hi);
+      }
+    }
+  };
+  unclaimed_tally g_unclaimed;
+}
+
 template <typename T> T sparse_mem::route_load(uint64_t pa) {
   if(pa >= SCC_BASE && pa <= SCC_END) return static_cast<T>(st->scc->read((uint32_t)(pa - SCC_BASE)));
-  switch(compute_mem_range_type(static_cast<uint32_t>(pa))) {
+  const mem_range_t r = compute_mem_range_type(static_cast<uint32_t>(pa));
+  switch(r) {
   case mem_range_t::mc_regs:  return static_cast<T>(st->mc->read(pa & 0x1ffff, sizeof(T)));
   case mem_range_t::hpc_regs: return static_cast<T>(st->hpc->read(pa & 0x7ffff, sizeof(T)));
-  default: return *reinterpret_cast<T*>(mem+pa);
+  default:
+    if(unclaimed_log) { g_unclaimed.note(r, pa, false); }
+    return *reinterpret_cast<T*>(mem+pa);
   }
 }
 template <typename T> void sparse_mem::route_store(uint64_t pa, T v) {
   if(pa >= SCC_BASE && pa <= SCC_END) { st->scc->write((uint32_t)(pa - SCC_BASE), (uint8_t)v); return; }
-  switch(compute_mem_range_type(static_cast<uint32_t>(pa))) {
+  const mem_range_t r = compute_mem_range_type(static_cast<uint32_t>(pa));
+  switch(r) {
   case mem_range_t::mc_regs:  st->mc->write(pa & 0x1ffff, static_cast<uint32_t>(v), sizeof(T)); break;
   case mem_range_t::hpc_regs: st->hpc->write(pa & 0x7ffff, static_cast<uint32_t>(v), sizeof(T)); break;
   default:
+    if(unclaimed_log) { g_unclaimed.note(r, pa, true); }
     if((pa & ~0xfffULL) == 0x1fd00000ULL && v != 0) st->brk = 1;
     *reinterpret_cast<T*>(mem+pa) = v;
     break;

@@ -24,6 +24,10 @@ namespace globals {
    * appended as an inst_record{pc=physical, vpc=virtual, inst} for the
    * rv64analyzer trace consumer. */
   extern retire_trace *retire_log;
+  /* --cpu r5000: present an R5000PC Indy (PRId/FIR imp 0x23, 32K+32K L1, no L2)
+   * and enable the MIPS IV instructions.  Default (false) is the R4400 / MIPS III
+   * machine r9999 implements: MIPS IV ops raise RI (or FP Unimplemented). */
+  extern bool cpu_r5000;
 };
 
 #endif

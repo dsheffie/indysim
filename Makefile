@@ -3,7 +3,7 @@ UNAME_S = $(shell uname -s)
 OBJ = main.o pseudo_bios.o loadelf.o disassemble.o helper.o interpret.o sparse_mem.o cache_model.o sgi_mc.o sgi_hpc.o sgi_scc.o sgi_scsi.o sgi_seeq.o saveState.o gdbstub.o githash.o shmem.o cosim.o
 
 ifeq ($(UNAME_S),Linux)
-	CXX = g++ -march=native #-flto
+	CXX = clang++-20 -march=native -flto
 	EXTRA_LD = -ldl -lffi -lbfd -lunwind -lboost_program_options -lboost_serialization -lcapstone
 endif
 

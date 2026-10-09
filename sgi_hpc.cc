@@ -4,6 +4,7 @@
 #include "sgi_seeq.hh"
 #include "sgi_scc.hh"
 #include "cache_model.hh"
+#include "sclog.hh"
 #include <cassert>
 #include <cstdlib>
 #include <ctime>
@@ -95,6 +96,7 @@ void sgi_hpc::scsi_fetch_chain(int ch) {
   d.bc    = rd_be32(s, desc + 4);
   d.nbdp  = rd_be32(s, desc + 8);
   d.count = d.bc & 0x3fff;
+  sclog(d.to_device ? 3 : 2, s->icnt, d.cbp, d.count, (uint32_t)s->pc, 0);
   static const bool dbg = getenv("SCSIDBG") != nullptr;
   if(dbg) fprintf(stderr, "sgi_hpc: ch%d FETCH desc=%08x cbp=%08x bc=%08x count=%u next=%08x %s%s\n",
                   ch, desc, d.cbp, d.bc, d.count, d.nbdp,
@@ -191,6 +193,24 @@ static const uint32_t HPCDMA_ETXD = 0x00008000u;  /* set by HPC when packet tx'd
 static const uint32_t HPCDMA_OWN  = 0x00004000u;  /* rx: HPC owns the buffer */
 static const uint32_t HPCDMA_BCNT = 0x00003fffu;  /* buffer byte count */
 
+/* Deferred-TX experiment knobs (default 0 = the original synchronous model, so the
+ * co-sim golden path is unchanged).  ENET_TX_LATENCY=n makes the TX channel process
+ * one descriptor per enet_poll() tick and hold ch_active for n more ticks after EOX,
+ * modelling the Seeq's wire time.  Only then can the guest ever OBSERVE ETXCTRL_ACTIVE
+ * set, which is what makes IRIX's if_ecintr take its CRBDP (0x1a000/0x1a004) path --
+ * with the synchronous model that path is unreachable and never gets traced.
+ * ENET_TX_CRBDP_NEXT=1 reports the descriptor AFTER the in-flight one, which is what
+ * the FPGA's ARM servicer publishes; 0 reports the in-flight one itself. */
+static const uint32_t g_tx_lat = getenv("ENET_TX_LATENCY") ? strtoul(getenv("ENET_TX_LATENCY"), nullptr, 0) : 0;
+/* ENET_TX_CRBDP_ARMLIKE=1 mimics the FPGA's ARM servicer: it publishes the TX CRBDP
+ * only once, at the END of a servicing pass, as the descriptor the walk stopped at.
+ * While a NEW chain is in flight the register therefore still holds the PREVIOUS
+ * chain's value, so neither of if_ecintr's two bounds can match any descriptor in the
+ * current walk and the reap loop has no terminator.  =0 models real HPC3 behaviour:
+ * the register tracks the in-flight descriptor live. */
+static const bool g_tx_crbdp_armlike = getenv("ENET_TX_CRBDP_ARMLIKE") != nullptr;
+static const bool g_tx_crbdp_dbg = getenv("ENET_TX_CRBDP_DBG") != nullptr;
+
 /* Drive one ENET DMA channel against the sgiseeq descriptor rings. Channel 1 is
  * TX (mem->Seeq->tap); channel 0 is RX (tap->Seeq->mem). Each descriptor is
  * {pbuf, cntinfo, pnext} in guest DRAM (big-endian, read via rd_be32). */
@@ -206,6 +226,9 @@ void sgi_hpc::enet_run_dma(int ch) {
       uint32_t cntinfo = rd_be32(s, desc + 4);
       uint32_t pnext   = rd_be32(s, desc + 8);
       uint32_t cnt     = cntinfo & HPCDMA_BCNT;
+      if(!g_tx_crbdp_armlike) {
+        enet_tx_crbdp = desc;                           /* real HPC3: tracks the in-flight descriptor */
+      }
       for(uint32_t i = 0; i < cnt; i++) {
         uint8_t *p = s->mem.get_raw_ptr(pbuf + i);
         s->seeq->tx_dma_w(*p);
@@ -221,10 +244,24 @@ void sgi_hpc::enet_run_dma(int ch) {
        * for Linux sgiseeq only because it puts the whole frame in one buffer.) */
       if(cntinfo & HPCDMA_EOX) {
         s->seeq->tx_flush();                            /* whole frame assembled -> out the tap */
-        d.active = false;                               /* end of chain */
+        if(g_tx_crbdp_armlike) {
+          enet_tx_crbdp = pnext;                        /* ARM servicer's tx_end, published once */
+        }
+        if(g_tx_lat == 0) {
+          d.active = false;                             /* end of chain */
+        }
+        else {
+          enet_tx_hold = g_tx_lat;                      /* draining onto the wire: ch_active stays set */
+        }
+        break;
+      }
+      if(g_tx_lat != 0) {
+        break;                                          /* one descriptor per poll tick */
       }
     }
-    d.ctrl &= ~0x200u;                                  /* ETXCTRL_ACTIVE clears when idle */
+    if(!d.active) {
+      d.ctrl &= ~0x200u;                                /* ETXCTRL_ACTIVE clears when idle */
+    }
   }
   else {
     /* RX: ring of HPC-owned descriptors. For each staged frame, fill the current
@@ -276,6 +313,17 @@ void sgi_hpc::enet_poll() {
   if((++enet_poll_ctr & 0x3ffu) != 0) { return; }
   s->seeq->poll();
   if(enet_dma[0].active) { enet_run_dma(0); }
+  if(g_tx_lat != 0 and enet_dma[1].active) {
+    if(enet_tx_hold != 0) {
+      if(--enet_tx_hold == 0) {
+        enet_dma[1].active = false;
+        enet_dma[1].ctrl &= ~0x200u;
+      }
+    }
+    else {
+      enet_run_dma(1);
+    }
+  }
 }
 
 /* Live mappable interrupt status (kernel's vmeistat).  bit5 = SCC serial INT
@@ -306,8 +354,14 @@ uint8_t sgi_hpc::ioc2_local0_live() {
   return st;
 }
 
-uint32_t sgi_hpc::read(uint32_t offs, size_t sz) {
+uint32_t sgi_hpc::read_impl(uint32_t offs, size_t sz) {
   DPRINTF("%s at pc %x : %x unimplemented\n", __PRETTY_FUNCTION__, s->pc, offs);
+  /* IOC2-window access log (0x59800..0x598ff) for diffing this model's device
+   * stream against another implementation's. */
+  static const bool g_ioc2_dbg = getenv("IOC2DBG") != nullptr;
+  if(g_ioc2_dbg and offs >= 0x59800u and offs <= 0x598ffu) {
+    fprintf(stderr, "IOC2-R offs=%05x sz=%zu pc=%08x\n", offs, sz, (uint32_t)s->pc);
+  }
   static const bool g_maclog = getenv("MACLOG") != nullptr;
   if(g_maclog and (uint32_t)s->pc >= 0x8800ab20u and (uint32_t)s->pc <= 0x8800b0b8u) {
     fprintf(stderr, "[maclog] pc=%08x get_nvreg reads offs=%05x sz=%zu\n",
@@ -368,7 +422,14 @@ uint32_t sgi_hpc::read(uint32_t offs, size_t sz) {
       r = (intstat & 0x00000c00u) ? 0x2u : 0x0u;
       break;
     case 0x15018: r = d.dmacfg; break;
-    case 0x18000: r = enet_crbdp; break;                /* CRBDP: current RX buffer descriptor ptr */
+    case 0x18000:
+    case 0x18004:                                       /* if_ecintr samples the TX CRBDP twice */
+      r = ch ? enet_tx_crbdp : ((n == 0x18000) ? enet_crbdp : 0);
+      if(g_tx_crbdp_dbg and ch) {
+        fprintf(stderr, "[txcrbdp] read w%u -> %08x (nbdp=%08x active=%d) pc=%08x\n",
+                (n == 0x18000) ? 0u : 1u, r, d.nbdp, (int)d.active, (uint32_t)s->pc);
+      }
+      break;
     default:      r = 0; break;
     }
     return __builtin_bswap32(r);
@@ -481,8 +542,26 @@ uint32_t sgi_hpc::read(uint32_t offs, size_t sz) {
   return 0;
 }
 
+/* full HPC3 register access log, for diffing against another implementation */
+static const bool hpc_access_log = getenv("HPCDBG") != nullptr;
+
+uint32_t sgi_hpc::read(uint32_t offs, size_t sz) {
+  uint32_t x = read_impl(offs, sz);
+  if(hpc_access_log) {
+    fprintf(stderr, "HPC-R offs=%05x -> %08x sz=%zu\n", offs, x, sz);
+  }
+  return x;
+}
+
 void sgi_hpc::write(uint32_t offs, uint32_t x, size_t sz) {
   //assert(sz == 4);
+  if(hpc_access_log) {
+    fprintf(stderr, "HPC-W offs=%05x <- %08x sz=%zu\n", offs, x, sz);
+  }
+  static const bool g_ioc2_dbg_w = getenv("IOC2DBG") != nullptr;
+  if(g_ioc2_dbg_w and offs >= 0x59800u and offs <= 0x598ffu) {
+    fprintf(stderr, "IOC2-W offs=%05x val=%08x sz=%zu pc=%08x\n", offs, x, sz, (uint32_t)s->pc);
+  }
   static const bool g_enet_dbg = getenv("ENET_DBG") != nullptr;
   if(g_enet_dbg and ((offs >= 0x14000 and offs <= 0x17fff) or
                      (offs >= 0x54000 and offs <= 0x5401f) or
@@ -566,6 +645,12 @@ void sgi_hpc::write(uint32_t offs, uint32_t x, size_t sz) {
       bool was_active = d.active;
       d.ctrl   = x;
       d.active = (x & 0x200u) != 0;                    /* HPC3_ERXCTRL/ETXCTRL_ACTIVE */
+      if(ch == 1 and d.active != was_active) {
+        /* Any arm/halt edge cancels a pending post-EOX drain.  if_ecintr's resync path
+         * (0x880582d0) halts the channel and rewinds nbdp, then re-arms; a stale hold
+         * would otherwise clear ch_active out from under the NEW chain and wedge TX. */
+        enet_tx_hold = 0;
+      }
       if(d.active and not was_active) { enet_run_dma(ch); }  /* newly armed: TX runs now, RX waits on frames */
       break;
     }

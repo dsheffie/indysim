@@ -12,6 +12,8 @@ static const bool g_mcfglog = getenv("MCFGLOG") != nullptr;   /* read-once debug
 
 /* device-trace spew off by default; set DEVTRACE=1 to re-enable. */
 static const bool dev_verbose = getenv("DEVTRACE") != nullptr;
+/* full MC register access log, for diffing against another implementation */
+static const bool mc_access_log = getenv("MCDBG") != nullptr;
 #define DPRINTF(...) do { if(dev_verbose) fprintf(stderr, __VA_ARGS__); } while(0)
 
 /* https://erikarn.github.io/sgi/indy/datasheets/sgi_indy_mc.pdf */
@@ -124,6 +126,9 @@ uint32_t sgi_mc::read(uint32_t offs, size_t sz) {
       break;
     }
   //printf("read access to MC, reg %x, value %x\n", offs, x);  
+  if(mc_access_log) {
+    fprintf(stderr, "MC-R reg=%04x -> %08x sz=%zu\n", offs, x, sz);
+  }
   return x;
 }
 
@@ -133,6 +138,9 @@ static uint8_t byte = 0;
 static uint32_t cbyte = 0;
 
 void sgi_mc::write(uint32_t offs, uint32_t x, size_t sz) {
+  if(mc_access_log) {
+    fprintf(stderr, "MC-W reg=%04x <- %08x sz=%zu\n", offs, x, sz);
+  }
   DPRINTF("write access to MC, reg %x, value %x, size %lu pc %lx\n", offs, x, sz, (unsigned long)s->pc);
   static const bool g_mclogw = getenv("MCLOG") != nullptr;
   if(g_mclogw and (uint32_t)s->pc >= 0x8800ab20u and (uint32_t)s->pc <= 0x8800b0b8u)

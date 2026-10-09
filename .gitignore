@@ -14,3 +14,24 @@ interp_mips
 *prom*.bin
 *.zip
 indy_4613/
+
+# build binaries (EL/BE jazz builds) + build logs
+interp_mips_el
+interp_mips_be
+build_*.log
+
+# simulation scratch / checkpoints / disk deltas
+*.ckpt
+*.delta
+delta.disk
+*.img
+perf.data*
+__pycache__/
+*.pre_*
+run.bbv
+golden_*.bin
+
+# run logs / dumps
+g*.log
+iss_boot.log
+gin.txt

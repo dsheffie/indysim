@@ -57,6 +57,8 @@ class sgi_hpc {
    * if_ec reads it to find which descriptor the HPC just filled; without it the
    * driver looks in the wrong place and drops every received frame. */
   uint32_t enet_crbdp = 0;
+  uint32_t enet_tx_crbdp = 0;      /* TX channel CRBDP (regs 0x1a000/0x1a004) */
+  uint32_t enet_tx_hold = 0;       /* deferred TX: poll ticks left before ch_active clears */
   uint32_t enet_poll_ctr = 0;      /* throttle the per-instruction tap read (a syscall) */
   void enet_run_dma(int ch);       /* pump the ENET descriptor walk vs the Seeq */
   /* i8254 PIT counter 2 (IP22 timer calibration; tcnt2=offs 0x598bb,
@@ -77,6 +79,7 @@ public:
   bool ioc2_ip2_pending() { return (ioc2_local0_live() & ioc2_local_mask[0]) != 0; }
   void enet_poll();   /* drain the tap into the Seeq + deliver pending RX via DMA */
   sgi_hpc(state_t *s) : s(s), intstat(0), misc(0) {}
+  uint32_t read_impl(uint32_t offs, size_t sz);
   uint32_t read(uint32_t offs, size_t sz);
   void write(uint32_t offs, uint32_t x, size_t sz);
 };

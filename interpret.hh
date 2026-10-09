@@ -343,6 +343,7 @@ static inline uint32_t get_branch_target(uint32_t pc, uint32_t inst) {
 }
 
 void initState(state_t *s);
+void tlbpm_report();   /* TLBPMSTATS: tlbwi/tlbwr page-size histogram (SIGUSR1) */
 void execMips(state_t *s);
 
 /* checkpoint save/restore (saveState.cc) -- full arch state + non-zero pages */
@@ -402,6 +403,7 @@ bool is_store_insn(state_t *s);
 #define PRID_R4400  0x00000440u   /* imp 0x04, rev 0x40 */
 #define PRID_R4600  0x00002020u   /* imp 0x20, rev 0x20 -- the SGI Indy CPU */
 #define PRID_R10000 0x00000900u   /* imp 0x09, rev 0x00 */
+#define PRID_R5000  0x00002320u   /* imp 0x23, rev 0x20 -- R5000 Indy (--cpu r5000) */
 /* The real SGI Indy (and MAME's indy_4610) is an R4600. IRIX's `start` reads
  * PRId and selects per-CPU init (cache config, TLB-refill handler variant,
  * cache-op handling) by the IMP field; presenting R4000 (imp 0x04) makes IRIX
