@@ -214,6 +214,14 @@ static const bool g_tx_crbdp_dbg = getenv("ENET_TX_CRBDP_DBG") != nullptr;
 /* Drive one ENET DMA channel against the sgiseeq descriptor rings. Channel 1 is
  * TX (mem->Seeq->tap); channel 0 is RX (tap->Seeq->mem). Each descriptor is
  * {pbuf, cntinfo, pnext} in guest DRAM (big-endian, read via rd_be32). */
+/* ENET_TXLOG=1: log the IRIX TX descriptor protocol in program order -- guest stores
+ * into the TX ring (interpret.cc), CACHE ops on it, the TX NBDP/ACTIVE doorbells, and
+ * what this DMA model reads per descriptor.  The ring is located from the first TX
+ * NBDP write (4 KB around it).  Read once. */
+bool     g_txlog = getenv("ENET_TXLOG") != nullptr;
+uint32_t g_txlog_lo = 0, g_txlog_hi = 0;
+uint64_t g_txlog_icnt = 0;
+
 void sgi_hpc::enet_run_dma(int ch) {
   scsi_dma_t &d = enet_dma[ch];
   if(!s->seeq) { return; }
@@ -226,14 +234,58 @@ void sgi_hpc::enet_run_dma(int ch) {
       uint32_t cntinfo = rd_be32(s, desc + 4);
       uint32_t pnext   = rd_be32(s, desc + 8);
       uint32_t cnt     = cntinfo & HPCDMA_BCNT;
-      if(!g_tx_crbdp_armlike) {
+      static uint32_t s_frame_len = 0, s_ip_want = 0;
+      if(s_frame_len == 0 && cnt >= 18) {               /* frame start: Ethernet + IP header */
+        uint8_t *h = s->mem.get_raw_ptr(pbuf);
+        s_ip_want = (h[12] == 0x08 && h[13] == 0x00) ? 14u + (((uint32_t)h[16] << 8) | h[17]) : 0;
+      }
+      s_frame_len += cnt;
+      if(g_txlog) {
+        fprintf(stderr, "[txlog] %llu DMA desc %08x bp %08x bc %08x dp %08x\n",
+                (unsigned long long)g_txlog_icnt, desc, pbuf, cntinfo, pnext);
+      }
+      if(cntinfo & HPCDMA_EOX) {
+        if(g_txlog && s_ip_want && s_frame_len != s_ip_want && !(s_ip_want < 60 && s_frame_len <= 60)) {
+          fprintf(stderr, "[txlog] %llu FRAME LEN MISMATCH frame %u ip %u\n",
+                  (unsigned long long)g_txlog_icnt, s_frame_len, s_ip_want);
+        }
+        s_frame_len = 0;
+        s_ip_want = 0;
+      }
+      /* ENET_CRBDP_PKT=1: CRBDP moves per PACKET (the in-flight packet's head).  IRIX's
+       * clean_xd_chain (if_ec2.c:958-1043), while TX is ACTIVE, reclaims every whole
+       * packet whose head lies before CRBDP -- without checking ETXD -- so a CRBDP inside
+       * a packet lets it reclaim the rest of that packet mid-walk (truncated frames). */
+      static const bool g_crbdp_pkt = getenv("ENET_CRBDP_PKT") != nullptr;
+      static bool s_pkt_open = false;
+      if(!g_tx_crbdp_armlike && (!g_crbdp_pkt || !s_pkt_open)) {
         enet_tx_crbdp = desc;                           /* real HPC3: tracks the in-flight descriptor */
       }
+      s_pkt_open = !(cntinfo & (HPCDMA_EOX | 0x40000000u));
       for(uint32_t i = 0; i < cnt; i++) {
         uint8_t *p = s->mem.get_raw_ptr(pbuf + i);
         s->seeq->tx_dma_w(*p);
       }
-      wr_be32(s, desc + 4, cntinfo | HPCDMA_ETXD);      /* HPC transmitted this buffer */
+      /* ENET_HEADETXD=1: IRIX reads ETXD on a packet's HEAD descriptor as "whole packet
+       * sent" and reclaims all of it -- so set the head's ETXD only at packet end */
+      static const bool g_headetxd = getenv("ENET_HEADETXD") != nullptr;
+      static uint32_t s_head = 0, s_head_bc = 0;
+      if(s_head == 0) {
+        s_head = desc;
+        s_head_bc = cntinfo;
+      }
+      if(!g_headetxd || desc != s_head) {
+        wr_be32(s, desc + 4, cntinfo | HPCDMA_ETXD);    /* HPC transmitted this buffer */
+      }
+      if(cntinfo & (HPCDMA_EOX | 0x40000000u)) {        /* packet end (EOXP or EOX) */
+        if(g_headetxd) {
+          wr_be32(s, s_head + 4, rd_be32(s, s_head + 4) | HPCDMA_ETXD);
+          if(g_txlog) {
+            fprintf(stderr, "[txlog] %llu DMA head ETXD %08x\n", (unsigned long long)g_txlog_icnt, s_head);
+          }
+        }
+        s_head = 0;
+      }
       if(cntinfo & HPCDMA_XIE) { intstat |= 0x800u; }   /* XIE -> TX chan irq (istat bit 11) */
       d.cbp  = pbuf;
       d.nbdp = pnext;
@@ -243,6 +295,9 @@ void sgi_hpc::enet_run_dma(int ch) {
        * (Flushing per-buffer split each descriptor into its own bogus frame -- worked
        * for Linux sgiseeq only because it puts the whole frame in one buffer.) */
       if(cntinfo & HPCDMA_EOX) {
+        if(g_txlog) {
+          fprintf(stderr, "[txlog] %llu DMA flush (EOX)\n", (unsigned long long)g_txlog_icnt);
+        }
         s->seeq->tx_flush();                            /* whole frame assembled -> out the tap */
         if(g_tx_crbdp_armlike) {
           enet_tx_crbdp = pnext;                        /* ARM servicer's tx_end, published once */
@@ -637,7 +692,16 @@ void sgi_hpc::write(uint32_t offs, uint32_t x, size_t sz) {
     x = __builtin_bswap32(x);
     switch(n) {
     case 0x14000: d.cbp    = x; break;
-    case 0x14004: d.nbdp   = x; break;
+    case 0x14004:
+      d.nbdp = x;
+      if(g_txlog && ch == 1) {
+        if(g_txlog_lo == 0) {
+          g_txlog_lo = x & ~0xfffu;
+          g_txlog_hi = g_txlog_lo + 0x1000u;
+        }
+        fprintf(stderr, "[txlog] %llu NBDP %08x\n", (unsigned long long)g_txlog_icnt, x);
+      }
+      break;
     case 0x15000: d.bc     = x; break;
     case 0x15018: d.dmacfg = x; break;
     case 0x18000: enet_crbdp = x; break;              /* CRBDP init (HPC updates it on RX fill) */
@@ -650,6 +714,10 @@ void sgi_hpc::write(uint32_t offs, uint32_t x, size_t sz) {
          * (0x880582d0) halts the channel and rewinds nbdp, then re-arms; a stale hold
          * would otherwise clear ch_active out from under the NEW chain and wedge TX. */
         enet_tx_hold = 0;
+      }
+      if(g_txlog && ch == 1) {
+        fprintf(stderr, "[txlog] %llu CTRL %08x (was %s)\n", (unsigned long long)g_txlog_icnt, x,
+                was_active ? "active" : "idle");
       }
       if(d.active and not was_active) { enet_run_dma(ch); }  /* newly armed: TX runs now, RX waits on frames */
       break;
