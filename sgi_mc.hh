@@ -28,7 +28,20 @@ class sgi_mc {
   uint32_t rpss_counter;          /* reg 0x1004 (rpss free-running counter) */
   uint32_t cpu_control[2] = {0};  /* reg 0x04/0x0c (cpuctrl0/cpuctrl1) */
   uint32_t memcfg[2] = {0};       /* reg 0xc4/0xcc (mconfig0/mconfig1) */
+  /* GIO64 graphics DMA ("virtual DMA", MC spec p.24; MAME sgi_mc perform_dma):
+   * moves lines between DRAM (through the 4-entry DMA TLB) and a GIO64 address --
+   * in practice the Newport REX3 host data port. */
+  uint32_t dma_gio_mask = 0, dma_gio_sub = 0, dma_cause = 0, dma_ctl = 0;
+  uint32_t dma_tlb_hi[4] = {0}, dma_tlb_lo[4] = {0};
+  uint32_t dma_memadr = 0, dma_size = 0, dma_stride = 0, dma_gio_adr = 0;
+  uint32_t dma_mode = 0, dma_count = 0, dma_run = 0;
+  bool dma_irq = false;           /* INT3 local0 MC_DMA (0x10) */
+  bool dma_read(uint32_t offs, uint32_t *x);
+  bool dma_write(uint32_t offs, uint32_t x);
+  uint32_t dma_translate(uint32_t va);
+  void dma_perform();
 public:
+  bool dma_irq_pending() const { return dma_irq; }
   sgi_mc(state_t *s) : s(s),
 		       eeprom_ctrl(0),
 		       cpu_error_status(0),

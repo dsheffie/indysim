@@ -3,6 +3,9 @@
 #include "sgi_scsi.hh"
 #include "sgi_seeq.hh"
 #include "sgi_scc.hh"
+#include "sgi_newport.hh"
+#include "sgi_ps2.hh"
+#include "sgi_mc.hh"
 #include "cache_model.hh"
 #include "sclog.hh"
 #include <cassert>
@@ -386,6 +389,9 @@ void sgi_hpc::enet_poll() {
 uint8_t sgi_hpc::ioc2_vmeistat_live() {
   uint8_t v = 0;
   if(s->scc && s->scc->int_pending()) v |= 0x20u;   /* bit5 = SERIAL DUART */
+  if(s->ps2 && s->ps2->irq()) {                      /* bit4 = keyboard/mouse 8042 */
+    v |= 0x10u;
+  }
   return v;
 }
 
@@ -404,8 +410,19 @@ uint8_t sgi_hpc::ioc2_local0_live() {
    * to clear it. */
   if(intstat & 0x00000c00u) st |= 0x08u;
   else                      st &= ~0x08u;
+  if(s->mc && s->mc->dma_irq_pending()) {     /* MC graphics DMA done (bit4) */
+    st |= 0x10u;
+  }
   if((ioc2_vmeistat_live() & ioc2_cmeimask[0]) != 0) st |= 0x80u;   /* LIO2 */
   else                                               st &= ~0x80u;
+  return st;
+}
+
+uint8_t sgi_hpc::ioc2_local1_live() {
+  uint8_t st = ioc2_local_status[1] | (s->np ? s->np->local1_bits() : 0);
+  if(ioc2_cmeimask[1] != 0 && (ioc2_vmeistat_live() & ioc2_cmeimask[1]) != 0) {   /* LIO3 (mappable 1) */
+    st |= 0x08u;
+  }
   return st;
 }
 
@@ -523,7 +540,7 @@ uint32_t sgi_hpc::read_impl(uint32_t offs, size_t sz) {
   /* IOC2/INT2 local interrupt status/mask (byte regs at IOC2 off N -> 0x59800+N*4+3) */
   else if(offs == 0x59883) { return ioc2_local0_live(); }   /* local0 status */
   else if(offs == 0x59887) { return ioc2_local_mask[0]; }   /* local0 mask   */
-  else if(offs == 0x5988b) { return ioc2_local_status[1]; } /* local1 status */
+  else if(offs == 0x5988b) { return ioc2_local1_live(); }   /* local1 status */
   else if(offs == 0x5988f) { return ioc2_local_mask[1]; }   /* local1 mask   */
   else if(offs == 0x59893) { return ioc2_vmeistat_live(); } /* map status (vmeistat) */
   else if(offs == 0x59897) { return ioc2_cmeimask[0]; }     /* map mask0 (cmeimask0) */
@@ -601,6 +618,11 @@ uint32_t sgi_hpc::read_impl(uint32_t offs, size_t sz) {
 static const bool hpc_access_log = getenv("HPCDBG") != nullptr;
 
 uint32_t sgi_hpc::read(uint32_t offs, size_t sz) {
+  /* IOC2 regs 0x10/0x11: 8042 data, status (byte at +3; word reads carry it in [31:24]) */
+  if(s->ps2 && (offs & ~7u) == 0x59840u) {
+    const uint8_t v = s->ps2->read((offs & 4) != 0);
+    return (sz == 1) ? v : ((uint32_t)v << 24);
+  }
   uint32_t x = read_impl(offs, sz);
   if(hpc_access_log) {
     fprintf(stderr, "HPC-R offs=%05x -> %08x sz=%zu\n", offs, x, sz);
@@ -610,6 +632,10 @@ uint32_t sgi_hpc::read(uint32_t offs, size_t sz) {
 
 void sgi_hpc::write(uint32_t offs, uint32_t x, size_t sz) {
   //assert(sz == 4);
+  if(s->ps2 && (offs & ~7u) == 0x59840u) {
+    s->ps2->write((offs & 4) != 0, (sz == 1) ? (uint8_t)x : (uint8_t)(x >> 24));
+    return;
+  }
   if(hpc_access_log) {
     fprintf(stderr, "HPC-W offs=%05x <- %08x sz=%zu\n", offs, x, sz);
   }

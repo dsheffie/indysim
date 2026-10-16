@@ -77,6 +77,12 @@ class sgi_hpc {
 public:
   /* true when an unmasked local0 interrupt is pending -> drive CP0 Cause IP2 */
   bool ioc2_ip2_pending() { return (ioc2_local0_live() & ioc2_local_mask[0]) != 0; }
+  /* local1 status incl. live Newport vertical retrace (0x80); unmasked -> CP0 Cause IP3 */
+  uint8_t ioc2_local1_live();
+  bool ioc2_ip3_pending() {
+    /* called every interrupt poll: nothing to compute while local1 is fully masked */
+    return ioc2_local_mask[1] != 0 && (ioc2_local1_live() & ioc2_local_mask[1]) != 0;
+  }
   void enet_poll();   /* drain the tap into the Seeq + deliver pending RX via DMA */
   sgi_hpc(state_t *s) : s(s), intstat(0), misc(0) {}
   uint32_t read_impl(uint32_t offs, size_t sz);

@@ -20,6 +20,9 @@
 #include "sgi_mc.hh"
 #include "sgi_hpc.hh"
 #include "sgi_scc.hh"
+#include "sgi_newport.hh"
+#include "newport_sdl.hh"
+#include "sgi_ps2.hh"
 #include "sgi_scsi.hh"
 #include "sgi_seeq.hh"
 #include "gdbstub.hh"
@@ -68,6 +71,8 @@ int main(int argc, char *argv[]) {
   uint64_t ckpt_icnt = 0;
   uint64_t ckpt_every = 0, ckpt_start = 0;
   bool virt = false;
+  bool newport = false;       /* --newport: SGI Newport graphics board */
+  bool sdl_out = false;       /* --sdl: live window for the Newport display */
   uint64_t bbv_interval = 0;
   std::string bbv_out;
   std::string brtrace_out;
@@ -90,6 +95,8 @@ int main(int argc, char *argv[]) {
       ("bbv-out", po::value<std::string>(&bbv_out)->default_value("run.bbv"), "BBV output file (SimPoint .bb format)")
       ("brtrace", po::value<std::string>(&brtrace_out), "oracle branch trace for r9999 ORACLE_BP: one record per retired control transfer (predecode.sv classes)")
       ("virt", po::bool_switch(&virt), "r9999-virt device-free platform: flat RAM at PA 0 -- no IP22 memory alias, no device window")
+      ("newport", po::bool_switch(&newport), "SGI Newport (XL8; NEWPORT_XL24=1 for XL24) in the GIO graphics slot; NEWPORT_PPM=<file> dumps the display at exit")
+      ("sdl", po::bool_switch(&sdl_out), "live SDL window for the Newport display (implies --newport)")
       ("checkpoint-every", po::value<uint64_t>(&ckpt_every)->default_value(0), "uniform sampling: dump a checkpoint every N instructions (to <checkpoint-out>.<icnt>) and keep running")
       ("checkpoint-start", po::value<uint64_t>(&ckpt_start)->default_value(0), "with --checkpoint-every: first dump at this icnt (default N)")
       ("checkpoint-out", po::value<std::string>(&ckpt_out)->default_value("checkpoint.bin"), "checkpoint output file for --checkpoint-at")
@@ -132,6 +139,17 @@ int main(int argc, char *argv[]) {
   s->scc = new sgi_scc(s);
   if(!disk.empty()) s->scsi = new sgi_scsi(s, disk, disk_delta, disk_write);
   s->seeq = new sgi_seeq(s);   /* Seeq 8003 ethernet; tap via env SEEQ_TAP=<ifname> */
+  newport_sdl *np_disp = nullptr;
+  if(!virt && (newport || sdl_out)) {
+    s->np = new sgi_newport(s);  /* Newport graphics in the GIO graphics slot */
+    s->ps2 = new sgi_ps2(s);     /* and the keyboard/mouse that go with it */
+    if(sdl_out) {
+      np_disp = new newport_sdl(s->np, s);
+      if(np_disp->ok()) {
+        s->np->attach_display(np_disp);
+      }
+    }
+  }
   sm->st = s;
   sm->route_devices = !virt;   /* virt: no IP22 low-memory alias, no device window */
 
@@ -456,6 +474,9 @@ int main(int argc, char *argv[]) {
               << " retire_trace records to " << retire_name << "\n";
   }
 
+  delete np_disp;
+  delete s->np;
+  delete s->ps2;
   delete s->mc; delete s->hpc; delete s->scc; delete s->scsi; delete s->seeq; delete s; delete sm;
   return 0;
 }

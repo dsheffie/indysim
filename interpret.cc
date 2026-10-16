@@ -19,6 +19,7 @@
 
 #include "interpret.hh"
 #include "sgi_hpc.hh"
+#include "sgi_newport.hh"
 #include "sgi_scc.hh"
 #include "sclog.hh"
 #include "disassemble.hh"
@@ -384,6 +385,9 @@ void maybe_take_interrupt(state_t *s) {
     if(g_pcs && (s->icnt % g_pcs) == 0)
       fprintf(stderr, "[pcsample] icnt=%llu pc=%08x\n", (unsigned long long)s->icnt, (uint32_t)s->pc); }
   if(s->scc) s->scc->tick(1);                          /* serial TX timing: keep exact */
+  if(__builtin_expect(s->icnt >= s->gfx_next_icnt, 0)) {
+    newport_retrace(s);                                /* Newport vertical retrace timer */
+  }
   /* CP0 Count is architecturally visible and the kernel's delay/clock
    * calibration reads it, so advance it (and latch the timer IP7) every
    * instruction -- cheap, and keeps the timer cycle-accurate. */
@@ -497,6 +501,16 @@ void maybe_take_interrupt(state_t *s) {
   if(s->hpc) s->hpc->enet_poll();   /* drain the tap into the Seeq + deliver RX via DMA */
   if(s->hpc && s->hpc->ioc2_ip2_pending()) s->cpr0[CPR0_CAUSE] |=  (1u << 10);
   else                                     s->cpr0[CPR0_CAUSE] &= ~(1u << 10);
+  /* IOC2/INT3 local1 (Newport vertical retrace) -> CP0 Cause IP[3] (bit 11).  Only
+   * with the Newport board: without it nothing drives local1 and IP3 stays as before */
+  if(s->np) {
+    if(s->hpc && s->hpc->ioc2_ip3_pending()) {
+      s->cpr0[CPR0_CAUSE] |= (1u << 11);
+    }
+    else {
+      s->cpr0[CPR0_CAUSE] &= ~(1u << 11);
+    }
+  }
   uint32_t sr = s->cpr0[CPR0_SR], cause = s->cpr0[CPR0_CAUSE];
   if((sr & SR_IE) && !(sr & (SR_EXL | SR_ERL)) && (((cause & sr) & 0xff00u) != 0u)) {
     if(g_tally) {
@@ -2654,10 +2668,16 @@ static void fpCmp(uint32_t inst, state_t *s) {
       HISTO(s, select_fp_insn<T>(mipsInsn::DP_CMP_LE, mipsInsn::SP_CMP_LE));            
       setConditionCode(s, v, cc);   /* FCSR bit 23/25.. is architectural; FCCR mirrors it */
       break;
-    default:
-      printf("unimplemented %s = %s\n", __func__, getCondName(cond).c_str());
-      exit(-1);
+    default: {
+      /* the other conditions: cond[0] = true if unordered, cond[1] = if equal,
+       * cond[2] = if less than (cond[3] only selects signalling on QNaN, which
+       * raises no exception here) -- e.g. c.olt from IRIS GL code (fsn) */
+      const bool un = (Tfs != Tfs) || (Tft != Tft);
+      v = (((cond & 1) != 0) && un) || (((cond & 2) != 0) && !un && (Tfs == Tft)) ||
+          (((cond & 4) != 0) && !un && (Tfs < Tft));
+      setConditionCode(s, v, cc);
       break;
+    }
     }
   if(globals::trace_retirement) {
     std::cout << std::hex

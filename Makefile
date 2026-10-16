@@ -1,6 +1,6 @@
 UNAME_S = $(shell uname -s)
 
-OBJ = main.o pseudo_bios.o loadelf.o disassemble.o helper.o interpret.o sparse_mem.o cache_model.o sgi_mc.o sgi_hpc.o sgi_scc.o sgi_scsi.o sgi_seeq.o saveState.o gdbstub.o githash.o shmem.o cosim.o
+OBJ = main.o pseudo_bios.o loadelf.o disassemble.o helper.o interpret.o sparse_mem.o cache_model.o sgi_mc.o sgi_hpc.o sgi_scc.o sgi_scsi.o sgi_seeq.o saveState.o gdbstub.o githash.o shmem.o cosim.o sgi_newport.o newport_sdl.o sgi_ps2.o
 
 ifeq ($(UNAME_S),Linux)
 	CXX = clang++-20 -march=native -flto
@@ -20,6 +20,14 @@ endif
 CXXFLAGS = -std=c++17 -g $(OPT)
 LIBS =  $(EXTRA_LD) -lpthread
 
+# SDL2 (optional): the live Newport display (--sdl).  Without it the build is
+# headless and NEWPORT_PPM=<file> is the way to see the screen.
+SDL_LIBS := $(shell sdl2-config --libs 2>/dev/null)
+ifneq ($(SDL_LIBS),)
+	CXXFLAGS += -DHAVE_SDL $(shell sdl2-config --cflags)
+	LIBS += $(SDL_LIBS)
+endif
+
 DEP = $(OBJ:.o=.d)
 OPT = -O3 -g -fomit-frame-pointer -std=c++17
 EXE = interp_mips
@@ -32,6 +40,13 @@ SF_BUILD = softfloat/build/Linux-x86_64-GCC
 SF_LIB   = $(SF_BUILD)/softfloat.a
 
 .PHONY : all clean
+
+# Newport tools: whole-trace replay (NEWPORT_TRACE) and the per-GO oracle (NEWPORT_DRAWCAP)
+NP_TOOL_OBJ = $(filter-out main.o,$(OBJ))
+tools/np_replay: tools/np_replay.cc $(NP_TOOL_OBJ) $(SF_LIB)
+	$(CXX) $(CXXFLAGS) $< $(NP_TOOL_OBJ) $(SF_LIB) $(LIBS) -o $@
+tools/np_goreplay: tools/np_goreplay.cc $(NP_TOOL_OBJ) $(SF_LIB)
+	$(CXX) $(CXXFLAGS) $< $(NP_TOOL_OBJ) $(SF_LIB) $(LIBS) -o $@
 
 all: $(EXE)
 

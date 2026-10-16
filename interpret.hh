@@ -107,6 +107,8 @@ class sgi_hpc;
 class sgi_scc;
 class sgi_scsi;
 class sgi_seeq;
+class sgi_newport;
+class sgi_ps2;
 class gdb_stub;
 
 class state_t{
@@ -154,6 +156,9 @@ public:
   sgi_scc *scc = nullptr;
   sgi_scsi *scsi = nullptr;
   sgi_seeq *seeq = nullptr;
+  sgi_newport *np = nullptr;   /* Newport graphics (REX3 @ 0x1f0f0000) */
+  sgi_ps2 *ps2 = nullptr;      /* IOC2 8042 keyboard/mouse (with --newport) */
+  uint64_t gfx_next_icnt = ~0ull; /* icnt of the next Newport retrace (never without one) */
   gdb_stub *gdb = nullptr;
 
   /* True while executing a branch/jump delay-slot instruction.  An exception in

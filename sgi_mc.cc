@@ -1,6 +1,7 @@
 #include "sgi_mc.hh"
 #include "helper.hh"
 #include "interpret.hh"
+#include "sgi_newport.hh"
 #include <cstdio>
 #include <cstdlib>
 
@@ -77,6 +78,9 @@ uint32_t sgi_mc::read(uint32_t offs, size_t sz) {
   if(g_mclog and (uint32_t)s->pc >= 0x8800ab20u and (uint32_t)s->pc <= 0x8800b0b8u)
     fprintf(stderr, "[mc-r] pc=%08x reg=%03x\n", (uint32_t)s->pc, offs);
   uint32_t x = 0;
+  if(dma_read(offs, &x)) {
+    return x;
+  }
   switch(offs)
     {
     case 0x0:    /* cpuctrl0 (even alias) */
@@ -142,6 +146,9 @@ void sgi_mc::write(uint32_t offs, uint32_t x, size_t sz) {
     fprintf(stderr, "MC-W reg=%04x <- %08x sz=%zu\n", offs, x, sz);
   }
   DPRINTF("write access to MC, reg %x, value %x, size %lu pc %lx\n", offs, x, sz, (unsigned long)s->pc);
+  if(dma_write(offs, x)) {
+    return;
+  }
   static const bool g_mclogw = getenv("MCLOG") != nullptr;
   if(g_mclogw and (uint32_t)s->pc >= 0x8800ab20u and (uint32_t)s->pc <= 0x8800b0b8u)
     fprintf(stderr, "[mc-w] pc=%08x reg=%03x val=%02x\n", (uint32_t)s->pc, offs, x & 0xff);
@@ -203,4 +210,201 @@ void sgi_mc::write(uint32_t offs, uint32_t x, size_t sz) {
       DPRINTF("write to unknown MC reg %x (lenient -> ignore)\n", offs);
       break;
     }
+}
+
+/* ---- GIO64 graphics DMA (MC spec "virtual DMA"; behaviour from MAME sgi_mc) ----
+ * Each register answers at either word of its 8-byte slot (the spec's /4 and /c
+ * aliases).  A start runs the whole transfer immediately; completion sets DMA_RUN
+ * bit 3 and, when DMA_CTL bit 4 is set, DMA_CAUSE bit 3 + INT3 local0 MC_DMA. */
+static const uint32_t DMA_MODE_TO_HOST = 1u << 1;
+static const uint32_t DMA_MODE_FILL = 1u << 3;
+static const uint32_t DMA_MODE_DIR = 1u << 4;
+
+bool sgi_mc::dma_read(uint32_t offs, uint32_t *x) {
+  const uint32_t r = offs & ~4u;
+  if(r >= 0x180 && r <= 0x1b8) {
+    const uint32_t i = (r - 0x180) >> 4;
+    *x = ((r - 0x180) & 8) ? dma_tlb_lo[i] : dma_tlb_hi[i];
+    return true;
+  }
+  switch(r)
+    {
+    case 0x150: *x = dma_gio_mask; return true;
+    case 0x158: *x = dma_gio_sub; return true;
+    case 0x160: *x = dma_cause; return true;
+    case 0x168: *x = dma_ctl; return true;
+    case 0x2000:
+    case 0x2008: *x = dma_memadr; return true;
+    case 0x2010: *x = dma_size; return true;
+    case 0x2018: *x = dma_stride; return true;
+    case 0x2020:
+    case 0x2028: *x = dma_gio_adr; return true;
+    case 0x2030: *x = dma_mode; return true;
+    case 0x2038: *x = dma_count; return true;
+    case 0x2040: *x = 0; return true;
+    case 0x2048: *x = dma_run; return true;
+    default:
+      return false;
+    }
+}
+
+bool sgi_mc::dma_write(uint32_t offs, uint32_t x) {
+  const uint32_t r = offs & ~4u;
+  if(r >= 0x180 && r <= 0x1b8) {
+    const uint32_t i = (r - 0x180) >> 4;
+    if((r - 0x180) & 8) {
+      dma_tlb_lo[i] = x;
+    }
+    else {
+      dma_tlb_hi[i] = x;
+    }
+    return true;
+  }
+  switch(r)
+    {
+    case 0x150: dma_gio_mask = x; return true;
+    case 0x158: dma_gio_sub = x; return true;
+    case 0x160:
+      dma_cause = x;
+      if(x == 0) {
+        dma_irq = false;
+      }
+      return true;
+    case 0x168: dma_ctl = x; return true;
+    case 0x2000:
+    case 0x2008: dma_memadr = x; return true;
+    case 0x2010:
+      dma_count = (dma_count & 0xffff0000u) | (x & 0xffffu);
+      dma_size = x;
+      return true;
+    case 0x2018:
+      dma_count = (dma_count & 0x0000ffffu) | (x & 0x03ff0000u);
+      dma_stride = x;
+      return true;
+    case 0x2020: dma_gio_adr = x; return true;
+    case 0x2028: dma_gio_adr = x; dma_perform(); return true;
+    case 0x2030: dma_mode = x; return true;
+    case 0x2038: dma_count = x; return true;
+    case 0x2040:
+      if(x & 1) {
+        dma_perform();
+      }
+      return true;
+    case 0x2070:                               /* GIO address + default params + start */
+      dma_gio_adr = x;
+      dma_size = 0x0001000c;
+      dma_stride = 0x00010000;
+      dma_count = 0x0001000c;
+      dma_mode = 0x00000028;
+      dma_perform();
+      return true;
+    default:
+      return false;
+    }
+}
+
+/* DMA TLB: 4 entries, each maps a 4 MB virtual region through a page of PTEs */
+uint32_t sgi_mc::dma_translate(uint32_t va) {
+  for(int e = 0; e < 4; e++) {
+    if((va & 0xffc00000u) == (dma_tlb_hi[e] & 0xffc00000u)) {
+      const uint32_t pte_pa = ((dma_tlb_lo[e] & 0x003fffc0u) << 6) + (((va & 0x003ff000u) >> 12) << 2);
+      const uint32_t pte = __builtin_bswap32(s->mem.get<uint32_t>(pte_pa));
+      return ((pte & 0x03ffffc0u) << 6) + (va & 0xfffu);
+    }
+  }
+  /* MAME returns 0 here; use the address as physical instead of scribbling on PA 0 */
+  static uint32_t nmiss = 0;
+  if(nmiss++ < 8) {
+    fprintf(stderr, "[mc-dma] TLB miss for %08x (treated as physical)\n", va);
+  }
+  return va;
+}
+
+static uint64_t dma_gio_read64(state_t *s, uint32_t gio) {
+  if(s->np && gio >= sgi_newport::BASE && gio < sgi_newport::BASE + sgi_newport::SIZE) {
+    return __builtin_bswap64(s->np->read(gio - sgi_newport::BASE, 8));
+  }
+  return __builtin_bswap64(s->mem.get<uint64_t>(gio));
+}
+
+static void dma_gio_write64(state_t *s, uint32_t gio, uint64_t v) {
+  if(s->np && gio >= sgi_newport::BASE && gio < sgi_newport::BASE + sgi_newport::SIZE) {
+    s->np->write(gio - sgi_newport::BASE, __builtin_bswap64(v), 8);
+    return;
+  }
+  s->mem.set<uint64_t>(gio, __builtin_bswap64(v));
+}
+
+void sgi_mc::dma_perform() {
+  static const bool g_dmalog = getenv("MCDMA_LOG") != nullptr;
+  uint32_t mem = dma_memadr;
+  uint32_t lines = dma_size >> 16;
+  uint32_t zoom = (dma_count >> 16) & 0x3ff;
+  uint32_t bytes = dma_count & 0xffff;
+  const uint32_t width = dma_size & 0xffff, line_zoom = (dma_stride >> 16) & 0x3ff;
+  const int16_t stride = (int16_t)dma_stride;
+  const bool to_host = dma_mode & DMA_MODE_TO_HOST, fill = dma_mode & DMA_MODE_FILL;
+  const bool up = dma_mode & DMA_MODE_DIR;
+  if(g_dmalog) {
+    fprintf(stderr, "[mc-dma] mem=%08x lines=%u width=%u zoom=%u stride=%d gio=%08x mode=%02x\n",
+            mem, lines, width, line_zoom, (int)stride, dma_gio_adr, dma_mode);
+  }
+  uint32_t moved = 0;
+  if(s->np) {
+    s->np->set_in_dma(true);
+  }
+  dma_size &= 0x0000ffff;
+  dma_count = 0;
+  while(lines > 0) {
+    lines--;
+    while(zoom > 0) {
+      zoom--;
+      while(bytes > 0) {
+        if(to_host && fill) {
+          s->mem.set<uint32_t>(dma_translate(mem), __builtin_bswap32(dma_gio_adr));
+          mem = up ? mem + 4 : mem - 4;
+          bytes = (bytes >= 4) ? bytes - 4 : 0;
+          moved += 4;
+        }
+        else if(to_host) {
+          const uint32_t len = bytes < 8 ? bytes : 8;
+          const uint64_t d = dma_gio_read64(s, dma_gio_adr);
+          for(uint32_t i = 0; i < len; i++) {
+            s->mem.set<uint8_t>(dma_translate(mem), (uint8_t)(d >> (56 - 8 * i)));
+            mem = up ? mem + 1 : mem - 1;
+          }
+          bytes -= len;
+          moved += len;
+        }
+        else {
+          const uint32_t len = bytes < 8 ? bytes : 8;
+          uint64_t d = 0;
+          for(uint32_t i = 0; i < len; i++) {
+            d |= (uint64_t)s->mem.get<uint8_t>(dma_translate(mem)) << (56 - 8 * i);
+            mem = up ? mem + 1 : mem - 1;
+          }
+          dma_gio_write64(s, dma_gio_adr, d);
+          bytes -= len;
+          moved += len;
+        }
+      }
+      bytes = width;
+      if(zoom > 0) {
+        mem = up ? mem - width : mem + width;
+      }
+    }
+    zoom = line_zoom;
+    mem += stride;
+  }
+  if(s->np) {
+    s->np->set_in_dma(false);
+  }
+  sgi_newport::trace_dma(s->icnt, to_host, dma_gio_adr, moved);
+  dma_memadr = mem;
+  dma_run = (dma_run | (1u << 3)) & ~(1u << 6);
+  if(dma_ctl & (1u << 4)) {
+    dma_cause |= 1u << 3;
+    dma_irq = true;
+    s->irq_poke = true;
+  }
 }

@@ -14,6 +14,7 @@
 #include "sgi_hpc.hh"
 #include "sgi_scc.hh"
 #include "sgi_indy.hh"
+#include "sgi_newport.hh"
 
 /* IRIX serial console (IOC2 Z8530 SCC), 16-byte window inside HPC space. */
 static const uint64_t SCC_BASE = 0x1fbd9830ULL;
@@ -257,6 +258,9 @@ namespace {
 
 template <typename T> T sparse_mem::route_load(uint64_t pa) {
   if(pa >= SCC_BASE && pa <= SCC_END) return static_cast<T>(st->scc->read((uint32_t)(pa - SCC_BASE)));
+  if(st->np && pa >= sgi_newport::BASE && pa < sgi_newport::BASE + sgi_newport::SIZE) {
+    return static_cast<T>(st->np->read((uint32_t)(pa - sgi_newport::BASE), sizeof(T)));
+  }
   const mem_range_t r = compute_mem_range_type(static_cast<uint32_t>(pa));
   switch(r) {
   case mem_range_t::mc_regs:  return static_cast<T>(st->mc->read(pa & 0x1ffff, sizeof(T)));
@@ -268,6 +272,12 @@ template <typename T> T sparse_mem::route_load(uint64_t pa) {
 }
 template <typename T> void sparse_mem::route_store(uint64_t pa, T v) {
   if(pa >= SCC_BASE && pa <= SCC_END) { st->scc->write((uint32_t)(pa - SCC_BASE), (uint8_t)v); return; }
+  if(st->np && pa >= sgi_newport::BASE && pa < sgi_newport::BASE + sgi_newport::SIZE) {
+    uint64_t raw = 0;
+    memcpy(&raw, &v, sizeof(T));               /* memory-order bytes, no sign extension */
+    st->np->write((uint32_t)(pa - sgi_newport::BASE), raw, sizeof(T));
+    return;
+  }
   const mem_range_t r = compute_mem_range_type(static_cast<uint32_t>(pa));
   switch(r) {
   case mem_range_t::mc_regs:  st->mc->write(pa & 0x1ffff, static_cast<uint32_t>(v), sizeof(T)); break;
