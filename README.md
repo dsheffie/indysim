@@ -1,4 +1,9 @@
-# interp_mips
+# indysim
+
+An SGI Indy (IP22) system simulator, split from
+[interp_mips](https://github.com/dsheffie/interp_mips) with its full history. Run with
+`--newport` (or `--sdl` for a window) for Newport XL graphics and PS/2 keyboard/mouse:
+IRIX 6.5 boots to Xsgi and the 4Dwm desktop.
 
 A fast **functional** MIPS (R4000 / SGI IP22) instruction-set simulator. It boots
 SGI IP22 firmware + kernels (IRIX 6.5, IP22 Linux) using a **1:1 virtual→physical
