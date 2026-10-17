@@ -226,11 +226,14 @@ int main(int argc, char *argv[]) {
      * slot per kernel; the FSBL jumps there blindly (jr $k0).  Without this,
      * Linux (entry 0x88325eb8) jumps to the IRIX entry and derails.  s->pc still
      * holds the ELF entry here (the --start-pc override runs below). */
-    uint32_t kentry = (uint32_t)s->pc;
-    uint8_t *kslot = (uint8_t*)sm->mem + 0x1fc00008;
-    kslot[0] = (kentry >> 24) & 0xff; kslot[1] = (kentry >> 16) & 0xff;
-    kslot[2] = (kentry >>  8) & 0xff; kslot[3] = (kentry >>  0) & 0xff;
-    std::cerr << "patched kentry slot @0xbfc00008 = " << std::hex << kentry << std::dec << "\n";
+    /* Only with a kernel: a real SGI PROM has code at 0xBFC00008. */
+    if(!filename.empty()) {
+      uint32_t kentry = (uint32_t)s->pc;
+      uint8_t *kslot = (uint8_t*)sm->mem + 0x1fc00008;
+      kslot[0] = (kentry >> 24) & 0xff; kslot[1] = (kentry >> 16) & 0xff;
+      kslot[2] = (kentry >>  8) & 0xff; kslot[3] = (kentry >>  0) & 0xff;
+      std::cerr << "patched kentry slot @0xbfc00008 = " << std::hex << kentry << std::dec << "\n";
+    }
   }
 
   /* fake-BIOS: start at the firmware boot stub (e.g. arcs_boot @ 0xa0003000);

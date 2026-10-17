@@ -19,6 +19,16 @@ struct state_t;
 class sgi_mc {
   state_t *s;
   uint32_t eeprom_ctrl;           /* reg 0x30/0x34: serial EEPROM bit-bang state */
+  /* 93CS56 serial EEPROM (the Indy NVRAM: 128 x 16-bit words) behind reg 0x34. */
+  uint16_t ee_mem[128];
+  uint32_t ee_sr = 0;             /* bits shifted in since CS rose */
+  uint32_t ee_nbits = 0;
+  uint32_t ee_out = 0;            /* READ: bits still to shift out, MSB first */
+  uint32_t ee_nout = 0;
+  uint32_t ee_op = 0, ee_addr = 0;
+  bool ee_wen = false;            /* EWEN seen */
+  bool ee_di = true;              /* level on the DI (to-host) pin */
+  void eeprom_write(uint32_t ctrl);
   uint32_t cpu_error_status;      /* reg 0xec (cstat) */
   uint32_t gio_error_status;      /* reg 0xfc (gstat) */
   uint32_t cpu_mem_access_config; /* reg 0xd4 (cmacc) */
@@ -67,6 +77,9 @@ public:
     /* MEMCFG = bank0 cfg (default 16 MiB), MEMCFG1 = bank1 cfg (default none).
      * 256 MiB (matches henny 0x3f203f40): MEMCFG=3f20 MEMCFG1=3f40 -> two 128 MiB
      * banks contiguous at PA 0x08000000 (base 0x20) and 0x10000000 (base 0x40). */
+    for(int i = 0; i < 128; i++) {
+      ee_mem[i] = 0xffff;          /* erased */
+    }
     const char *e  = getenv("MEMCFG");
     const char *e1 = getenv("MEMCFG1");
     uint32_t cfg0 = e  ? (uint32_t)strtoul(e,  nullptr, 16) : 0x2320u;

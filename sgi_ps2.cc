@@ -69,7 +69,15 @@ void sgi_ps2::refill() {
   if(obf) {
     return;
   }
-  if(!kbd_q.empty() && !(ccb & 0x10)) {
+  if(!ctl_q.empty()) {
+    /* the 8042's own replies reach the output buffer even with both ports disabled
+     * (Linux reads the command byte back right after disabling them) */
+    out = ctl_q.front();
+    ctl_q.pop_front();
+    obf = true;
+    aux_obf = false;
+  }
+  else if(!kbd_q.empty() && !(ccb & 0x10)) {
     out = kbd_q.front();
     kbd_q.pop_front();
     obf = true;
@@ -128,19 +136,19 @@ void sgi_ps2::write(bool cmd_port, uint8_t v) {
 void sgi_ps2::ctl_cmd(uint8_t v) {
   switch(v)
     {
-    case 0x20: kbd_q.push_front(ccb); break;   /* read command byte */
+    case 0x20: ctl_q.push_back(ccb); break;    /* read command byte */
     case 0x60: case 0xd1: case 0xd2: case 0xd3: case 0xd4:
       pending_cmd = v;
       break;
     case 0xa7: ccb |= 0x20; break;             /* disable aux */
     case 0xa8: ccb &= ~0x20; break;            /* enable aux */
-    case 0xa9: kbd_q.push_back(0x00); break;   /* aux interface test: ok */
-    case 0xaa: kbd_q.push_back(0x55); break;   /* controller self test: ok */
-    case 0xab: kbd_q.push_back(0x00); break;   /* kbd interface test: ok */
+    case 0xa9: ctl_q.push_back(0x00); break;   /* aux interface test: ok */
+    case 0xaa: ctl_q.push_back(0x55); break;   /* controller self test: ok */
+    case 0xab: ctl_q.push_back(0x00); break;   /* kbd interface test: ok */
     case 0xad: ccb |= 0x10; break;             /* disable kbd */
     case 0xae: ccb &= ~0x10; break;            /* enable kbd */
-    case 0xc0: kbd_q.push_back(0x00); break;   /* read input port */
-    case 0xd0: kbd_q.push_back(0x01); break;   /* read output port */
+    case 0xc0: ctl_q.push_back(0x00); break;   /* read input port */
+    case 0xd0: ctl_q.push_back(0x01); break;   /* read output port */
     default: break;                            /* 0xfe reset pulse etc.: ignored */
     }
 }

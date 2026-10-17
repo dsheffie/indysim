@@ -123,7 +123,10 @@ uint8_t sgi_scc::read(uint32_t offs) {
 
 void sgi_scc::write(uint32_t offs, uint8_t b) {
   int ch = chan(offs);
-  if(is_data_reg(offs)) {
+  /* WR8 (the Tx buffer through the control port) is the data register too: the
+   * SGI PROM's early putc writes WR0 = point-high, then the char. */
+  if(is_data_reg(offs) || (ptr[ch] == 8)) {
+    ptr[ch] = 0;
     putchar((int)b);                         /* echo the byte (order preserved) */
     fflush(stdout);
     /* Writing the next char re-arms: clears the pending Tx int (deasserts IP2),

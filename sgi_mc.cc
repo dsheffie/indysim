@@ -79,7 +79,7 @@ uint32_t sgi_mc::read(uint32_t offs, size_t sz) {
     fprintf(stderr, "[mc-r] pc=%08x reg=%03x\n", (uint32_t)s->pc, offs);
   uint32_t x = 0;
   if(dma_read(offs, &x)) {
-    return x;
+    return __builtin_bswap32(x);   /* registers hold guest values; the bus is memory order */
   }
   switch(offs)
     {
@@ -117,8 +117,9 @@ uint32_t sgi_mc::read(uint32_t offs, size_t sz) {
        * Indy has no EISA, so EPRESENT stays clear. */
       x = sys_id;
       break;
-    case 0x30:   /* eeprom (even alias): serial EEPROM data bit, SDATAI high */
-      x = 0x10;//eeprom_ctrl & (~0x10);
+    case 0x30:   /* eeprom (even alias) */
+    case 0x34:   /* eeprom: control bits as written, SDATAI (0x10) = the EEPROM's DI pin */
+      x = __builtin_bswap32((eeprom_ctrl & ~0x10u) | (ee_di ? 0x10u : 0u));
       break;
     case 0x1004: /* rpss free-running counter (read-only) */
       //printf("rpss counter read\n");
@@ -136,17 +137,93 @@ uint32_t sgi_mc::read(uint32_t offs, size_t sz) {
   return x;
 }
 
-uint32_t nbits = 0;
-static uint8_t eerom[256] = {0};
-static uint8_t byte = 0;
-static uint32_t cbyte = 0;
+/* 93CS56 (x16): CS high, then on each rising SCK shift in a start bit (1), a
+ * 2-bit opcode and an 8-bit address (Linux ip22-nvram BITS_IN_COMMAND = 11).
+ *   10 READ   -- a dummy 0, then 16 data bits MSB first on DI
+ *   01 WRITE  -- 16 data bits in; programmed when CS falls (needs EWEN)
+ *   11 ERASE  -- word -> 0xffff when CS falls (needs EWEN)
+ *   00 + addr[7:6]: 11 EWEN, 00 EWDS, 01 WRAL, 10 ERAL
+ * Programming is instant: the ready/busy status shown on DI after CS rises
+ * again is always "ready" (1).  PRE (bit 0) selects the protect register; its
+ * commands are accepted and ignored.  Bits: PRE 0x01, CS 0x02, SCK 0x04,
+ * SDATAO (host->EEPROM) 0x08, SDATAI (EEPROM->host) 0x10. */
+void sgi_mc::eeprom_write(uint32_t ctrl) {
+  const uint32_t prev = eeprom_ctrl;
+  eeprom_ctrl = ctrl;
+  const bool cs = (ctrl & 0x02) != 0;
+  if(!cs) {
+    if((prev & 0x02) && !(prev & 0x01) && ee_wen && (ee_nbits >= 11)) {
+      const uint32_t idx = ee_addr & 0x7f;
+      if((ee_op == 1) && (ee_nbits == 27)) {
+	ee_mem[idx] = ee_sr & 0xffff;
+      }
+      else if(ee_op == 3) {
+	ee_mem[idx] = 0xffff;
+      }
+      else if((ee_op == 0) && ((ee_addr >> 6) == 1) && (ee_nbits == 27)) {
+	for(int i = 0; i < 128; i++) {
+	  ee_mem[i] = ee_sr & 0xffff;
+	}
+      }
+      else if((ee_op == 0) && ((ee_addr >> 6) == 2)) {
+	for(int i = 0; i < 128; i++) {
+	  ee_mem[i] = 0xffff;
+	}
+      }
+    }
+    ee_sr = 0;
+    ee_nbits = 0;
+    ee_nout = 0;
+    ee_di = true;                  /* ready */
+    return;
+  }
+  if(!(prev & 0x02)) {
+    ee_sr = 0;
+    ee_nbits = 0;
+    ee_nout = 0;
+    ee_di = true;                  /* ready/busy status: always ready */
+  }
+  const bool rise = (ctrl & 0x04) && !(prev & 0x04);
+  if(!rise) {
+    return;
+  }
+  if(ee_nout != 0) {
+    --ee_nout;
+    ee_di = (ee_out >> ee_nout) & 1;
+    return;
+  }
+  const uint32_t bit = (ctrl >> 3) & 1;
+  if((ee_nbits == 0) && (bit == 0)) {
+    return;                        /* waiting for the start bit */
+  }
+  ee_sr = (ee_sr << 1) | bit;
+  ++ee_nbits;
+  if(ee_nbits == 11) {
+    ee_op = (ee_sr >> 8) & 3;
+    ee_addr = ee_sr & 0xff;
+    ee_sr = 0;
+    if(ee_op == 2) {
+      ee_out = ee_mem[ee_addr & 0x7f];
+      ee_nout = 16;
+      ee_di = false;               /* the dummy 0 before the data */
+    }
+    else if(ee_op == 0) {
+      if((ee_addr >> 6) == 3) {
+	ee_wen = true;
+      }
+      else if((ee_addr >> 6) == 0) {
+	ee_wen = false;
+      }
+    }
+  }
+}
 
 void sgi_mc::write(uint32_t offs, uint32_t x, size_t sz) {
   if(mc_access_log) {
     fprintf(stderr, "MC-W reg=%04x <- %08x sz=%zu\n", offs, x, sz);
   }
   DPRINTF("write access to MC, reg %x, value %x, size %lu pc %lx\n", offs, x, sz, (unsigned long)s->pc);
-  if(dma_write(offs, x)) {
+  if(dma_write(offs, __builtin_bswap32(x))) {
     return;
   }
   static const bool g_mclogw = getenv("MCLOG") != nullptr;
@@ -189,22 +266,9 @@ void sgi_mc::write(uint32_t offs, uint32_t x, size_t sz) {
     case 0xfc:   /* gstat GIO error status (any write clears) */
       gio_error_status = 0;
       break;
-    case 0x30:   /* eeprom serial EEPROM control: bit-bang CS/CLK/DATA */
-      eeprom_ctrl = x;
-      if ( ((x>>1) & 3) == 3) {
-	DPRINTF("data bit %d, bit %u\n", (x>>3)&1, nbits);
-	byte = (byte << 1) | ((x>>3)&1);
-	++nbits;	
-	if(nbits==8) {
-	  DPRINTF("wrote byte %u : %x\n", cbyte, (int)byte);	  
-	  eerom[cbyte] = byte;
-	  ++cbyte;
-	  nbits = 0;
-	  byte = 0;
-
-	}
-
-      }
+    case 0x30:   /* eeprom (even alias) */
+    case 0x34:   /* eeprom serial EEPROM control: bit-bang PRE/CS/CLK/DATA */
+      eeprom_write(__builtin_bswap32(x));
       break;
     default:
       DPRINTF("write to unknown MC reg %x (lenient -> ignore)\n", offs);
@@ -242,7 +306,12 @@ bool sgi_mc::dma_read(uint32_t offs, uint32_t *x) {
     case 0x2030: *x = dma_mode; return true;
     case 0x2038: *x = dma_count; return true;
     case 0x2040: *x = 0; return true;
-    case 0x2048: *x = dma_run; return true;
+    case 0x2048:
+      /* the transfer is instant, but the PROM's VDMA clear requires one read
+       * that shows RUNNING (bit 6) before it polls for completion */
+      *x = dma_run;
+      dma_run &= ~(1u << 6);
+      return true;
     default:
       return false;
     }
@@ -401,7 +470,7 @@ void sgi_mc::dma_perform() {
   }
   sgi_newport::trace_dma(s->icnt, to_host, dma_gio_adr, moved);
   dma_memadr = mem;
-  dma_run = (dma_run | (1u << 3)) & ~(1u << 6);
+  dma_run = dma_run | (1u << 3) | (1u << 6);
   if(dma_ctl & (1u << 4)) {
     dma_cause |= 1u << 3;
     dma_irq = true;

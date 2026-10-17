@@ -27,6 +27,12 @@ class sgi_hpc {
   uint8_t ioc2_vmeistat_live();      /* live mappable status (bit5 = SCC serial INT) */
   uint8_t ioc2_local0_live();        /* local0 status incl. live SCSI0 intrq + LIO2 */
   uint32_t pbus_pio_config[10] = {0};/* reg 0x5d000 block: per-channel PIO config (10 ch) */
+  /* DS1386 RTC: register N (byte) at 0x60000 + 4N.  Regs 0-0xa = the clock (host
+   * time + rtc_offset once the guest has set it), 0xb.. = battery-backed RAM. */
+  uint8_t rtc_ram[0x2000] = {0};
+  int64_t rtc_offset = 0;
+  uint8_t rtc_read(uint32_t reg);
+  void rtc_write(uint32_t reg, uint8_t v);
   uint32_t pbus_dma_config[8] = {0}; /* reg 0x5c000 block: per-channel DMA config (8 ch) */
 
   /* HPC3 SCSI DMA channel (HD0/HD1).  Pure-physical scatter-gather: walk the

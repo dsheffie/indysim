@@ -41,6 +41,7 @@ private:
   uint8_t out = 0;
   bool last_was_cmd = false;
   std::deque<uint8_t> kbd_q, aux_q;
+  std::deque<uint8_t> ctl_q;       /* controller command replies: not gated by the port disables */
   /* keyboard */
   uint8_t kbd_pending = 0;        /* keyboard command waiting for its argument */
   bool kbd_enabled = true;

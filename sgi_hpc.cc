@@ -32,6 +32,18 @@ static time_t rtc_now(state_t *s) {
   return ::time(nullptr);
 }
 
+/* hundredths of a second for the DS1386 clock (same time source as rtc_now);
+ * the SGI PROM polls it to check that the oscillator runs */
+static uint32_t rtc_hundredths(state_t *s) {
+  static const bool det = getenv("DETTIME") != nullptr;
+  if(det) {
+    return (uint32_t)((s->icnt / 1000000ull) % 100);   /* DETTIME_RATE / 100 */
+  }
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  return (uint32_t)(ts.tv_nsec / 10000000);
+}
+
 /*
  * HPC3 (High Performance Peripheral Controller, 3rd gen) register map.
  *
@@ -546,60 +558,11 @@ uint32_t sgi_hpc::read_impl(uint32_t offs, size_t sz) {
   else if(offs == 0x59897) { return ioc2_cmeimask[0]; }     /* map mask0 (cmeimask0) */
   else if(offs == 0x5989b) { return ioc2_cmeimask[1]; }     /* map mask1 (cmeimask1) */
   else if(offs == 0x5989f) { return ioc2_cmepol; }          /* map polarity (cmepol) */
-  /* DS1286/DS1386 RTC in the bbRAM window (byte-per-word x4: reg N at 0x60000+N*4).
-   * Return the live host wall-clock in BCD so IRIX boots with a sane date instead
-   * of 1970/2000 -- a bogus clock makes the man-page index (makewhatis/sgindex)
-   * look perpetually stale, triggering a full rebuild on every boot. Value in
-   * byte[31:24] -- the BE load path bswaps device reads (like SYSID at 0x59858).
-   * localtime() is read fresh per access; the few reads of a full clock snapshot
-   * land within microseconds of each other, so the fields stay coherent. */
-  else if(offs >= 0x60000 and offs <= 0x6002f) {
-    /* HENNY-MATCH: under DETTIME, return the henny FPGA RTL's FROZEN ds1386 date
-     * (rtl/hpc3.sv: 2030-01-01 00:00:00, dow=1) bit-exactly, so the golden ISS takes
-     * the SAME date-dependent reconfigure path as silicon. IRIX rtodc() (IP22.c:3617-3644)
-     * decodes the BCD year as year = 1940 + bcd, with a pivot: bcd<45 adds 30 (so bcd
-     * 00-44 -> 1970-2014, bcd 45-99 -> 1985-2039). BCD 0x90 = 90 >= 45 -> 1940+90 = 2030.
-     * 2030 is deliberately AFTER the clean image's ~2026-06 /var/sysgen mtimes, so a
-     * reconfigure writes /unix with mtime > sysgen and IRIX reconfigures ONCE, then skips
-     * it on every later boot -- no disk backdating needed. month/date default 1. */
-    static const bool g_det = getenv("DETTIME") != nullptr;
-    if(g_det) {
-      uint8_t hv;
-      switch(offs) {
-      case 0x60018: hv = 0x01; break;  /* day-of-week = 1 */
-      case 0x60020: hv = 0x01; break;  /* date = 1st */
-      case 0x60024: hv = 0x01; break;  /* month = January */
-      case 0x60028: hv = 0x90; break;  /* year BCD 90 -> IRIX rtodc 1940+90 = 2030 (matches hpc3.sv) */
-      default:      hv = 0x00; break;  /* sec/min/hour/cmd = 0 (BCD 00) */
-      }
-      return (uint32_t)hv << 24;
-    }
-    time_t now = rtc_now(s);
-    struct tm lt; localtime_r(&now, &lt);
-    auto bcd = [](int n) -> uint8_t { return (uint8_t)(((n / 10) << 4) | (n % 10)); };
-    uint8_t v;
-    switch(offs) {
-    case 0x60004: v = bcd(lt.tm_sec);        break;  /* seconds (reg 1) */
-    case 0x60008: v = bcd(lt.tm_min);        break;  /* minutes (reg 2) */
-    case 0x60010: v = bcd(lt.tm_hour);       break;  /* hours   (reg 4, 24h BCD) */
-    case 0x60018: v = bcd(lt.tm_wday + 1);   break;  /* day-of-week (reg 6, 1-7) */
-    case 0x60020: v = bcd(lt.tm_mday);       break;  /* date    (reg 8, 1-31) */
-    case 0x60024: v = bcd(lt.tm_mon + 1);    break;  /* month   (reg 9, 1-12) */
-    case 0x60028: v = bcd(lt.tm_year % 100); break;  /* year    (reg 10, BCD 2-digit) */
-    default:      v = 0x00;                  break;  /* command/alarm/hundredths -> not-busy */
-    }
-    return (uint32_t)v << 24;
-  }
-  else if(offs >= 0x000604e8 and offs <= 0x000604fc and (offs & 3) == 0) {
-    /* IP22 station ethernet address in the ds1386 bbRAM at word 250..255
-     * (ip22-nvram.c: ip22_nvram_read, EADDR_NVOFS=250, Indy/Guiness path reads
-     * hpc3c0->bbram[reg*2 + {0,1}]; bbram base is 0x60100, so reg 250 -> 0x604e8).
-     * Real SGI OUI 08:00:69 so the sgiseeq driver gets a valid MAC instead of the
-     * all-zero address (which fails is_valid_ether_addr).  Byte in [31:24]; the BE
-     * load path bswaps device reads to the kernel's low byte (like SYSID/RTC). */
-    static const uint8_t mac[6] = {0x08, 0x00, 0x69, 0x12, 0x34, 0x56};
-    uint32_t i = (offs - 0x000604e8) >> 2;   /* 0..5 */
-    return (uint32_t)mac[i] << 24;
+  else if(offs >= 0x60000 and offs <= 0x67fff) {  /* DS1386 RTC + bbRAM (rtc_read) */
+    /* byte value in [31:24] for a word load -- the BE load path bswaps device
+     * reads (like SYSID); a byte load (the SGI PROM's lbu at reg*4+3) gets it as is */
+    const uint8_t v = rtc_read((offs - 0x60000) >> 2);
+    return (sz == 1) ? v : ((uint32_t)v << 24);
   }
   else if(offs >= 0x00058000 and offs <= 0x0005bfff) { /* PBUS PIO data ports */
     int id = ((offs>>8) & 0x7f)>>2;
@@ -612,6 +575,92 @@ uint32_t sgi_hpc::read_impl(uint32_t offs, size_t sz) {
 
   //exit(-1);
   return 0;
+}
+
+/* DS1286/DS1386 RTC in the bbRAM window (byte-per-word x4: reg N at 0x60000+N*4).
+ * Until the guest sets the clock, return the live host wall-clock in BCD so IRIX
+ * boots with a sane date instead of 1970/2000 -- a bogus clock makes the man-page
+ * index (makewhatis/sgindex) look perpetually stale, triggering a full rebuild on
+ * every boot.  localtime() is read fresh per access; the few reads of a full clock
+ * snapshot land within microseconds of each other, so the fields stay coherent.
+ * A guest write to a clock field (the SGI PROM sets it when it finds it invalid)
+ * becomes an offset from host time, so the clock reads back what was written and
+ * keeps ticking.  Everything above the clock is battery-backed RAM. */
+static uint8_t to_bcd(int n) { return (uint8_t)(((n / 10) << 4) | (n % 10)); }
+static int from_bcd(uint8_t v) { return ((v >> 4) * 10) + (v & 0xf); }
+
+uint8_t sgi_hpc::rtc_read(uint32_t reg) {
+  if(reg >= 0x13a && reg <= 0x13f) {
+    /* IP22 station ethernet address in the ds1386 bbRAM at word 250..255
+     * (ip22-nvram.c: ip22_nvram_read, EADDR_NVOFS=250, Indy/Guiness path reads
+     * hpc3c0->bbram[reg*2 + {0,1}]; bbram base is 0x60100, so reg 250 -> 0x604e8).
+     * Real SGI OUI 08:00:69 so the sgiseeq driver gets a valid MAC instead of the
+     * all-zero address (which fails is_valid_ether_addr). */
+    static const uint8_t mac[6] = {0x08, 0x00, 0x69, 0x12, 0x34, 0x56};
+    return mac[reg - 0x13a];
+  }
+  if(reg > 0xa) {
+    return rtc_ram[reg];
+  }
+  /* HENNY-MATCH: under DETTIME, return the henny FPGA RTL's FROZEN ds1386 date
+   * (rtl/hpc3.sv: 2030-01-01 00:00:00, dow=1) bit-exactly, so the golden ISS takes
+   * the SAME date-dependent reconfigure path as silicon. IRIX rtodc() (IP22.c:3617-3644)
+   * decodes the BCD year as year = 1940 + bcd, with a pivot: bcd<45 adds 30 (so bcd
+   * 00-44 -> 1970-2014, bcd 45-99 -> 1985-2039). BCD 0x90 = 90 >= 45 -> 1940+90 = 2030.
+   * 2030 is deliberately AFTER the clean image's ~2026-06 /var/sysgen mtimes, so a
+   * reconfigure writes /unix with mtime > sysgen and IRIX reconfigures ONCE, then skips
+   * it on every later boot -- no disk backdating needed. month/date default 1. */
+  static const bool g_det = getenv("DETTIME") != nullptr;
+  if(g_det) {
+    switch(reg)
+      {
+      case 0x6: return 0x01;   /* day-of-week = 1 */
+      case 0x8: return 0x01;   /* date = 1st */
+      case 0x9: return 0x01;   /* month = January */
+      case 0xa: return 0x90;   /* year BCD 90 -> IRIX rtodc 1940+90 = 2030 (matches hpc3.sv) */
+      default:  return 0x00;   /* sec/min/hour/cmd = 0 (BCD 00) */
+      }
+  }
+  const time_t now = rtc_now(s) + (time_t)rtc_offset;
+  struct tm lt;
+  localtime_r(&now, &lt);
+  switch(reg)
+    {
+    case 0x1: return to_bcd(lt.tm_sec);          /* seconds */
+    case 0x2: return to_bcd(lt.tm_min);          /* minutes */
+    case 0x4: return to_bcd(lt.tm_hour);         /* hours (24h BCD) */
+    case 0x6: return to_bcd(lt.tm_wday + 1);     /* day-of-week (1-7) */
+    case 0x8: return to_bcd(lt.tm_mday);         /* date (1-31) */
+    case 0x9: return to_bcd(lt.tm_mon + 1);      /* month (1-12); EOSC/ESQW = 0 (running) */
+    case 0xa: return to_bcd(lt.tm_year % 100);   /* year (BCD 2-digit) */
+    case 0x0: return to_bcd(rtc_hundredths(s));  /* hundredths */
+    default:  return rtc_ram[reg];               /* alarms -> stored */
+    }
+}
+
+void sgi_hpc::rtc_write(uint32_t reg, uint8_t v) {
+  if(reg > 0xa || reg == 0x6) {
+    rtc_ram[reg] = v;                            /* RAM; day-of-week follows the date */
+    return;
+  }
+  const time_t now = rtc_now(s) + (time_t)rtc_offset;
+  struct tm lt;
+  localtime_r(&now, &lt);
+  const int n = from_bcd(v & 0x7f);
+  switch(reg)
+    {
+    case 0x1: lt.tm_sec = n; break;
+    case 0x2: lt.tm_min = n; break;
+    case 0x4: lt.tm_hour = from_bcd(v & 0x3f); break;
+    case 0x8: lt.tm_mday = n; break;
+    case 0x9: lt.tm_mon = from_bcd(v & 0x1f) - 1; break;
+    case 0xa: lt.tm_year = 100 + n; break;       /* 20xx; only the 2-digit BCD reads back */
+    default:
+      rtc_ram[reg] = v;                          /* hundredths (ignored), alarms */
+      return;
+    }
+  lt.tm_isdst = -1;
+  rtc_offset = (int64_t)mktime(&lt) - (int64_t)rtc_now(s);
 }
 
 /* full HPC3 register access log, for diffing against another implementation */
@@ -779,6 +828,9 @@ void sgi_hpc::write(uint32_t offs, uint32_t x, size_t sz) {
   else if(offs == 0x59897) { ioc2_cmeimask[0] = (uint8_t)x; } /* map mask0 (cmeimask0) */
   else if(offs == 0x5989b) { ioc2_cmeimask[1] = (uint8_t)x; } /* map mask1 (cmeimask1) */
   else if(offs == 0x5989f) { ioc2_cmepol     = (uint8_t)x; } /* map polarity (cmepol)  */
+  else if(offs >= 0x60000 and offs <= 0x67fff) { /* DS1386 RTC + bbRAM */
+    rtc_write((offs - 0x60000) >> 2, (sz == 1) ? (uint8_t)x : (uint8_t)(x >> 24));
+  }
   else if(offs >= 0x40000 and offs <= 0x47fff) { /* WD33C93 HD0 (SASR=+3/SCMD=+7) */
     if(s->scsi) {
       s->scsi->pio_w(((offs - 0x40000) >> 2) & 1, (uint8_t)x);
