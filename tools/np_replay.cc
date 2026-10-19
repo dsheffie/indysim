@@ -171,5 +171,11 @@ int main(int argc, char **argv) {
            ops[kv.first & 3], adr[(kv.first >> 2) & 7], (unsigned long long)k.gos, (unsigned long long)k.pixels,
            k.sec, k.gos / k.sec / 1e6, k.pixels / k.sec / 1e6, k.sec / k.gos * 1e9);
   }
+  if(getenv("NP_AUXDUMP")) {   /* raw aux (CID/PUP/OLAY) planes, FB_W x FB_H u32 */
+    FILE *af = fopen(getenv("NP_AUXDUMP"), "wb");
+    fwrite(np->fb_word(0x80000000u), 4, sgi_newport::FB_W * sgi_newport::FB_H, af);
+    fclose(af);
+  }
+  delete np;                  /* NEWPORT_PPM=<file>: the destructor dumps the final display */
   return 0;
 }

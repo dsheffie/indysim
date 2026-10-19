@@ -376,8 +376,20 @@ bool sgi_mc::dma_write(uint32_t offs, uint32_t x) {
 uint32_t sgi_mc::dma_translate(uint32_t va) {
   for(int e = 0; e < 4; e++) {
     if((va & 0xffc00000u) == (dma_tlb_hi[e] & 0xffc00000u)) {
-      const uint32_t pte_pa = ((dma_tlb_lo[e] & 0x003fffc0u) << 6) + (((va & 0x003ff000u) >> 12) << 2);
+      /* the PTE page's frame is lo[25:6], the same field as a PTE's: MAME's 0x003fffc0
+       * drops lo[25:22], which only works while page tables sit below PA 0x10000000 */
+      const uint32_t pte_pa = ((dma_tlb_lo[e] & 0x03ffffc0u) << 6) + (((va & 0x003ff000u) >> 12) << 2);
       const uint32_t pte = __builtin_bswap32(s->mem.get<uint32_t>(pte_pa));
+      static const bool g_xlog = getenv("MCDMA_XLOG") != nullptr;
+      static uint32_t s_last_page = ~0u;
+      if(g_xlog && (va >> 12) != s_last_page) {
+        s_last_page = va >> 12;
+        const uint32_t pa = ((pte & 0x03ffffc0u) << 6) + (va & 0xfffu);
+        fprintf(stderr, "[mc-xlate] va=%08x e=%d hi=%08x lo=%08x pte_pa=%08x pte=%08x pa=%08x bytes=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+                va, e, dma_tlb_hi[e], dma_tlb_lo[e], pte_pa, pte, pa,
+                s->mem.get<uint8_t>(pa), s->mem.get<uint8_t>(pa + 1), s->mem.get<uint8_t>(pa + 2), s->mem.get<uint8_t>(pa + 3),
+                s->mem.get<uint8_t>(pa + 4), s->mem.get<uint8_t>(pa + 5), s->mem.get<uint8_t>(pa + 6), s->mem.get<uint8_t>(pa + 7));
+      }
       return ((pte & 0x03ffffc0u) << 6) + (va & 0xfffu);
     }
   }
