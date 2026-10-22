@@ -543,6 +543,19 @@ static void raise_ades(state_t *s) {
   raise_common(s, 5u);
 }
 
+/* Data Bus Error (ExcCode 7).  The IP22 MC answers a load to an address that no
+ * GIO/HPC slave claims with a bus-error response; the exception is precise at the
+ * load (EPC/Cause.BD as usual) and BadVAddr is NOT written (R4000 -- raise_common
+ * leaves it alone).  Reuses s->tlb_fault as the generic "exception taken, abort
+ * this instruction" flag so every load's existing `if(s->tlb_fault) return;` guard
+ * drops the destination write.  Linux's get_dbe()-based GIO probe depends on this
+ * to discover Newport; see ip22_gio_bus_error(). */
+static void raise_dbe(state_t *s) {
+  set_exc_pc(s);
+  raise_common(s, 7u);
+  s->tlb_fault = true;
+}
+
 /* Reserved Instruction exception setup (ExcCode=10), no diagnostic message. */
 static void take_exception_ri(state_t *s) {
   set_exc_pc(s);
@@ -1306,6 +1319,23 @@ static inline void ptetrack_probe(state_t *, uint32_t, uint32_t) {}
 
 /* wrapper: feed every successful cacheable DATA access (va,pa) to the VIPT
  * alias-frequency instrument, then return the PA unchanged. */
+
+/* IP22 MC GIO/HPC bus-error decode: a load to an address no slave answers times
+ * out and comes back as a data bus error (cause 7).  Two regions Linux's GIO bus
+ * probe (arch/mips/sgi-ip22/ip22-gio.c) relies on:
+ *   - the second HPC3 (chip1 @0x1fb00000) is not populated on Indy, so the gate
+ *     read hpc3c1->pbdma[1] must bus-error for the kernel to probe the GFX slot;
+ *   - the Newport GFX slot has no GIO signature at its base (GIO_SLOT_GFX_BASE =
+ *     0x1f000000), so reads below the Newport register window (0x1f0f0000) bus-
+ *     error, while the Newport USTATUS read at 0x1f0f133c answers -- that is how
+ *     ip22_check_gio() tells Newport (id 0x7e) is present.  (Empty EXP0/EXP1 slots
+ *     read back 0, which the probe accepts as Empty, so they need no bus error.) */
+static inline bool ip22_gio_bus_error(uint32_t pa) {
+  if(pa >= 0x1fb00000u && pa < 0x1fb80000u) { return true; }        /* HPC3 chip1: absent */
+  if(pa >= 0x1f000000u && pa < 0x1f0f0000u) { return true; }        /* GFX slot base, below Newport */
+  return false;
+}
+
 static uint32_t va_translate(state_t *s, uint64_t va, tlb_op op) {
   if(g_wsprof && op == tlb_op::store) {                 /* WS profiler markers */
     uint32_t v32 = (uint32_t)va;
@@ -1329,6 +1359,11 @@ static uint32_t va_translate(state_t *s, uint64_t va, tlb_op op) {
   if(g_eccfg and op == tlb_op::store and (pa & ~0x3u) >= 0x08308ec0u and (pa & ~0x3u) <= 0x08309500u) {
     fprintf(stderr, "[eccfg] pc=%08x va=%08x pa=%08x (ec-config write)\n",
             (uint32_t)s->pc, (uint32_t)va, pa);
+  }
+  /* Data bus error on a load the MC can't satisfy.  Checked after translation so a
+   * TLB miss still takes precedence; stores are left alone (the GIO probe loads). */
+  if(op == tlb_op::load && !s->tlb_fault && ip22_gio_bus_error(pa)) {
+    raise_dbe(s);
   }
   return pa;
 }
