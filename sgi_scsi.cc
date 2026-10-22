@@ -1,4 +1,5 @@
 #include "sgi_scsi.hh"
+#include "qcow2_reader.hh"
 #include "interpret.hh"
 #include <cstdio>
 #include <cstdlib>
@@ -41,25 +42,54 @@ sgi_scsi::sgi_scsi(state_t *s, const std::string &disk_path, const std::string &
     fprintf(stderr, "sgi_scsi: --disk-write overrides --disk-delta (direct writes, no COW)\n");
     this->delta_path.clear();
   }
-  fd = open(disk_path.c_str(), direct_write ? O_RDWR : O_RDONLY);
-  if(fd < 0) {
-    fprintf(stderr, "sgi_scsi: cannot open disk image '%s'%s\n", disk_path.c_str(),
-            direct_write ? " for read/write (--disk-write)" : "");
-    return;
+  fd = disk_path.empty() ? -1 : open(disk_path.c_str(), direct_write ? O_RDWR : O_RDONLY);
+  if(fd >= 0) {
+    /* qcow2? peek the magic; if so, parse it and size the disk from the qcow2
+     * virtual size.  The reader is read-only -- writes go through the COW overlay
+     * / --disk-delta like a read-only raw image -- so --disk-write is rejected. */
+    uint8_t magic[4];
+    if(pread(fd, magic, 4, 0) == 4 && qcow2_reader::is_magic(magic)) {
+      qcow = new qcow2_reader();
+      if(qcow->open(fd)) {
+        nblocks = qcow->virtual_size() / 512;
+        if(this->direct_write) {
+          fprintf(stderr, "sgi_scsi: --disk-write is not supported on a qcow2 image; "
+                          "writes go to the in-memory overlay (use --disk-delta to persist)\n");
+          this->direct_write = false;   /* member: block_write() uses the COW overlay */
+          direct_write = false;         /* parameter: keep this ctor's own diagnostics honest */
+        }
+      } else {
+        fprintf(stderr, "sgi_scsi: '%s' is qcow2 but unsupported -- modeling an empty bus\n",
+                disk_path.c_str());
+        delete qcow; qcow = nullptr;
+        close(fd); fd = -1;
+      }
+    } else {
+      struct stat st;
+      if(fstat(fd, &st) == 0)
+        nblocks = (uint64_t)st.st_size / 512;
+    }
+  } else if(!disk_path.empty()) {
+    fprintf(stderr, "sgi_scsi: cannot open disk image '%s'%s -- modeling an empty bus\n",
+            disk_path.c_str(), direct_write ? " for read/write (--disk-write)" : "");
   }
-  struct stat st;
-  if(fstat(fd, &st) == 0)
-    nblocks = (uint64_t)st.st_size / 512;
+  /* The WD33C93 controller is always present (a real Indy always has it).  With no
+   * media (fd < 0 -- no --disk, or an unopenable image) the bus is simply empty and
+   * every SELECT times out; the controller still resets and answers its registers,
+   * which is what lets a diskless Linux boot clear the driver's reset + target probe
+   * instead of hanging on ASR_INT. */
   sense[0] = 0x70; sense[7] = 0x0a;   /* fixed-format REQUEST SENSE: NO SENSE */
   reset();
-  SPRINTF("sgi_scsi: '%s' = %llu blocks (%llu MB)%s\n", disk_path.c_str(),
-          (unsigned long long)nblocks, (unsigned long long)(nblocks/2048),
-          direct_write ? " [DIRECT WRITE]" : "");
-  if(direct_write) {
-    fprintf(stderr, "sgi_scsi: DIRECT WRITE to '%s' -- the image WILL be modified in place\n",
-            disk_path.c_str());
+  if(fd >= 0) {
+    SPRINTF("sgi_scsi: '%s' = %llu blocks (%llu MB)%s\n", disk_path.c_str(),
+            (unsigned long long)nblocks, (unsigned long long)(nblocks/2048),
+            direct_write ? " [DIRECT WRITE]" : "");
+    if(direct_write) {
+      fprintf(stderr, "sgi_scsi: DIRECT WRITE to '%s' -- the image WILL be modified in place\n",
+              disk_path.c_str());
+    }
+    if(!this->delta_path.empty()) load_delta();
   }
-  if(!this->delta_path.empty()) load_delta();
 }
 
 /* delta sidecar format: 8-byte magic "IMDELTA1" then repeated records of
@@ -97,7 +127,7 @@ void sgi_scsi::flush_delta() const {
   fprintf(stderr, "sgi_scsi: wrote %zu delta blocks to '%s'\n", overlay.size(), delta_path.c_str());
 }
 
-sgi_scsi::~sgi_scsi() { if(fd >= 0) close(fd); }
+sgi_scsi::~sgi_scsi() { delete qcow; if(fd >= 0) close(fd); }
 
 void sgi_scsi::reset() {
   SPRINTF("sgi_scsi: reset() called @icnt=%llu (intrq->false)\n", (unsigned long long)s->icnt);
@@ -110,6 +140,7 @@ void sgi_scsi::block_read(uint64_t lba, uint8_t *dst) {
   auto it = overlay.find(lba);            /* COW: written blocks win */
   if(it != overlay.end()) { memcpy(dst, it->second.data(), 512); return; }
   if(lba >= nblocks) { memset(dst, 0, 512); return; }
+  if(qcow) { qcow->read_block(lba, dst); return; }   /* qcow2 backing (read-only) */
   ssize_t n = pread(fd, dst, 512, (off_t)(lba * 512));
   if(n != 512) memset(dst, 0, 512);
 }
@@ -216,12 +247,13 @@ void sgi_scsi::select_and_transfer() {
     return;
   }
 
-  /* Only one device on the bus, at DISK_TARGET. Selecting any other target ID
-   * gets a selection timeout (no device responded) -- matches the iris WD33C93
-   * model: command-phase DISCONNECTED + status SELECTION_TIMEOUT + INTRQ. Without
-   * this the fused model answered as a disk for every target and IRIX's hinv
-   * reported 7 drives (one per probed ID). */
-  if((regs[WD_DEST_ID] & 7) != DISK_TARGET) {
+  /* Only one device on the bus, at DISK_TARGET (and only when media is attached).
+   * Selecting any other target ID -- or any target at all on an empty bus (fd < 0,
+   * no --disk) -- gets a selection timeout (no device responded): command-phase
+   * DISCONNECTED + status SELECTION_TIMEOUT + INTRQ.  This matches the iris WD33C93
+   * model; without it the fused model answered as a disk for every target and
+   * IRIX's hinv reported 7 drives (one per probed ID). */
+  if(fd < 0 || (regs[WD_DEST_ID] & 7) != DISK_TARGET) {
     regs[WD_AUX_STATUS]   &= ~(AUX_CIP | AUX_BSY);
     regs[WD_AUX_STATUS]   |= AUX_INT;
     regs[WD_SCSI_STATUS]   = ST_SELECTION_TIMEOUT;

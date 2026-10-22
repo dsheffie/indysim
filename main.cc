@@ -85,7 +85,7 @@ int main(int argc, char *argv[]) {
       ("retiretrace", po::value<std::string>(&retire_name), "emit boost retire_trace for rv64analyzer")
       ("maxicnt,m", po::value<uint64_t>(&maxinsns)->default_value(~(0UL)), "max instructions")
       ("start-pc", po::value<std::string>(&start_pc)->default_value(""), "fake-BIOS: start PC e.g. 0xa0003000 (skips pseudo_bios + arcs patch; firmware does the handoff)")
-      ("disk",     po::value<std::string>(&disk),     "raw SCSI disk image for HD0 (e.g. irix65.img)")
+      ("disk",     po::value<std::string>(&disk),     "SCSI disk image for HD0 (raw, or read-only qcow2 -- e.g. irix65.img / irix65.qcow2)")
       ("disk-delta", po::value<std::string>(&disk_delta), "persistent COW sidecar for --disk: writes survive across runs (image stays read-only); flushed on exit + SIGUSR2")
       ("disk-write", po::bool_switch(&disk_write), "write straight through to --disk (O_RDWR, no COW) -- the image IS modified in place, like the FPGA; lets IRIX reconfigure persist. Overrides --disk-delta")
       ("prom",     po::value<std::string>(&prom),     "flat PROM firmware blob loaded at phys 0x1fc00000 (e.g. henry_arcs.bin); use with --start-pc 0xbfc00000")
@@ -137,7 +137,9 @@ int main(int argc, char *argv[]) {
   s->mc  = new sgi_mc(s);
   s->hpc = new sgi_hpc(s);
   s->scc = new sgi_scc(s);
-  if(!disk.empty()) s->scsi = new sgi_scsi(s, disk, disk_delta, disk_write);
+  /* always present the WD33C93 (empty bus if no --disk) so the sgiwd93 probe's reset
+   * completes -- otherwise a diskless Linux boot hangs polling ASR_INT. */
+  s->scsi = new sgi_scsi(s, disk, disk_delta, disk_write);
   s->seeq = new sgi_seeq(s);   /* Seeq 8003 ethernet; tap via env SEEQ_TAP=<ifname> */
   newport_sdl *np_disp = nullptr;
   if(!virt && (newport || sdl_out)) {
