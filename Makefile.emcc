@@ -1,55 +1,100 @@
-# Makefile.emcc -- build interp_mips as WASM with emscripten, for the lolz.
+# Makefile.emcc -- build indysim as WASM with emscripten.
 #
-# Status: gets you a wasm/js bundle, BUT the codebase links three compiled
-# libraries that have no emscripten port (boost_program_options,
-# boost_serialization, capstone) plus libunwind + BSD sockets. This Makefile
-# assumes the lightweight path: small `#ifdef __EMSCRIPTEN__` guards in the
-# sources that compile out --checkpoint (serialization), --gdb (sockets),
-# dbt_backtrace (libunwind), and the capstone disassembler. emscripten
-# auto-defines __EMSCRIPTEN__, so no -D is needed and the native Makefile is
-# untouched. If those guards are NOT yet in the tree, this build will fail to
-# compile/link -- ask Claude to add them.
+# Source the emsdk first:  source ~/emsdk/emsdk_env.sh
+# Then:                    make -f Makefile.emcc
 #
-# Prereqs: a sourced emsdk (`emcc` on PATH). boost HEADERS only are needed
-# (functional/hash is header-only); point BOOST_INC at them if not in the
-# default sysroot.
+# This builds the FULL graphical sim (Newport + PS/2 + SEEQ + SCSI), not the old
+# headless subset. The native main.cc is untouched; web_main.cc is the emscripten
+# entry point (replaces main.o). Debug/host-only features are compiled out via
+# #ifdef __EMSCRIPTEN__ guards and by omitting their objects:
+#   omitted: main.o (->web_main.o), gdbstub.o (sockets), shmem.o/cosim.o (shm),
+#            saveState.o (boost_serialization), newport_sdl.o (SDL2)
+#   stubbed: disassemble.cc (capstone), helper.cc (libunwind backtrace)
+#   ported : sparse_mem.cc (4 GiB NORESERVE mmap -> 512 MiB calloc; see the file)
 #
-# Usage:
-#   make -f Makefile.emcc            # build interp_mips.js + .wasm
-#   make -f Makefile.emcc clean
-#   node interp_mips.js -- -f vmlinux.32   # run under node (see PRELOAD below)
+# M1 config: INVOKE_RUN=1 + NODERAWFS=1 so a quick
+#   node interp_mips.js -f <kernel> --prom <fsbl> --start-pc 0xbfc00000 -m N
+# boots to the SCC serial console against real host paths. The browser harness
+# (M2+) flips to INVOKE_RUN=0 + a Worker + WORKERFS for bring-your-own disk.
 
 CXX = em++
+CC  = emcc
 
-OBJ = main.o pseudo_bios.o loadelf.o disassemble.o helper.o interpret.o \
-      sparse_mem.o sgi_mc.o sgi_hpc.o sgi_scc.o sgi_scsi.o saveState.o \
-      gdbstub.o githash.o
+# all is the default goal even though the SoftFloat rules are defined first below.
+.DEFAULT_GOAL := all
 
-# boost headers only (no compiled boost libs link under emscripten).
-BOOST_INC ?=
-CXXFLAGS = -std=c++17 -O3 -g -fomit-frame-pointer $(BOOST_INC)
+# emcc objects live in their own dir so they never collide with the native
+# clang-built *.o in the source tree (same basenames, different toolchain).
+ODIR = emcc_obj
+OBJ = $(addprefix $(ODIR)/, web_main.o pseudo_bios.o loadelf.o disassemble.o \
+      helper.o interpret.o sparse_mem.o cache_model.o sgi_mc.o sgi_hpc.o \
+      sgi_scc.o sgi_scsi.o qcow2_reader.o chd_reader.o sgi_seeq.o sgi_newport.o sgi_ps2.o githash.o)
 
-# wasm32 caps linear memory at 4 GiB and cannot lazily reserve like a
-# MAP_NORESERVE mmap, so the simulator's 4 GiB sparse_mem cannot be backed
-# 1:1. ALLOW_MEMORY_GROWTH lets the heap grow on demand; bump INITIAL_MEMORY
-# as needed. (For a faithful full 4 GiB model you'd flip on MEMORY64 and build
-# the whole toolchain for wasm64 -- left off here.)
+# Vendored libchdr built for wasm (emcmake); read MAME CHD disk images (chd_reader.cc).
+# Static libs: libchdr + its bundled zlib/lzma/zstd (zstd single-threaded -- no wasm
+# pthreads).  libchdr-static references the dep libs, so it is listed before them.
+CHD_WBUILD = libchdr/build-wasm
+CHD_WLIB   = $(CHD_WBUILD)/libchdr-static.a
+CHD_WLIBS  = $(CHD_WLIB) \
+             $(CHD_WBUILD)/deps/zlib-1.3.1/libz.a \
+             $(CHD_WBUILD)/deps/lzma-24.05/liblzma.a \
+             $(CHD_WBUILD)/deps/zstd-1.5.6/build/cmake/lib/libzstd.a
+
+# Boost is header-only here (functional/hash, and serialization headers that are
+# never instantiated in the web objects). Do NOT add -I/usr/include: emcc would
+# then pull host glibc headers over its own musl sysroot. Instead expose ONLY
+# boost via a shim dir holding a single symlink, so <stdint.h> etc. still resolve
+# from emcc's sysroot.
+BOOST_SYS  ?= /usr/include/boost
+BOOST_SHIM  = boost_shim
+BOOST_INC  ?= -I$(BOOST_SHIM)
+CXXFLAGS = -std=c++17 -O3 -g -fomit-frame-pointer -fexceptions -I. $(BOOST_INC)
+
+# ---- Berkeley SoftFloat-3, compiled for wasm --------------------------------
+# The committed softfloat.a is an x86-64 build; wasm needs its own. SoftFloat is
+# portable C, but source/ holds BOTH the FAST_INT64 (extF80) and the memory-array
+# (*M) variants, and only the per-target Makefile's OBJS list selects the right
+# subset. So rather than glob, we delegate to the submodule's own x86 Makefile
+# (already configured FAST_INT64 + 8086-SSE), out-of-tree in $(SF_ODIR), with CC
+# and ar overridden for emcc. No submodule files are modified.
+SF_ROOT   = softfloat
+SF_SRCDIR = $(SF_ROOT)/source
+SF_X86DIR = $(SF_ROOT)/build/Linux-x86_64-GCC
+SF_ODIR   = sf_wasm_obj
+SF_LIB    = $(SF_ODIR)/softfloat.a
+
+$(SF_LIB):
+	mkdir -p $(SF_ODIR)
+	cp $(SF_X86DIR)/platform.h $(SF_ODIR)/
+	$(MAKE) -C $(SF_ODIR) -f $(abspath $(SF_X86DIR)/Makefile) \
+	  SOURCE_DIR=$(abspath $(SF_SRCDIR)) \
+	  'COMPILE_C=emcc -c -DSOFTFLOAT_FAST_INT64 $$(SOFTFLOAT_OPTS) $$(C_INCLUDES) -O2 -o $$@' \
+	  'MAKELIB=emar crs $$@'
+# -----------------------------------------------------------------------------
+
 EMFLAGS = \
   -s ALLOW_MEMORY_GROWTH=1 \
-  -s INITIAL_MEMORY=512MB \
-  -s MAXIMUM_MEMORY=4GB \
+  -s INITIAL_MEMORY=64MB \
+  -s MAXIMUM_MEMORY=2GB \
   -s STACK_SIZE=8MB \
-  -s EXIT_RUNTIME=1 \
+  -s MODULARIZE=1 \
+  -s EXPORT_NAME=createIndysim \
+  -s ENVIRONMENT=web,worker,node \
   -s INVOKE_RUN=0 \
-  -s EXPORTED_RUNTIME_METHODS=callMain,FS \
-  -s NODERAWFS=0 \
+  -s FORCE_FILESYSTEM=1 \
+  -s EXPORTED_RUNTIME_METHODS=callMain,FS,ccall \
+  -s EXPORTED_FUNCTIONS=_main,_web_key_event,_web_mouse_event \
+  -lworkerfs.js \
+  -lnodefs.js \
   -fexceptions
 
-# To bake guest images into the virtual FS, list them here, e.g.:
-#   PRELOAD = --preload-file vmlinux.32 --preload-file delta.disk
-# Without NODERAWFS the program only sees preloaded files. Under node you can
-# instead set NODERAWFS=1 above to get real host filesystem access.
-PRELOAD ?=
+# Guest Linux kernel + synthetic FSBL baked into the virtual FS (small, non-proprietary).
+# NOTHING proprietary is preloaded: the IRIX disk image AND a real SGI PROM are both
+# mounted at runtime from user-picked Files via WORKERFS (lazy slice reads; images are
+# multi-GB). @/path maps host->virtual. INVOKE_RUN=0: the worker mounts the files, THEN
+# calls main (callMain) with args.
+PRELOAD ?= --preload-file guest/vmlinux.32@/vmlinux.32 \
+           --preload-file guest/henry_arcs.bin@/henry_arcs.bin
 
 DEP = $(OBJ:.o=.d)
 EXE = interp_mips.js
@@ -57,16 +102,32 @@ EXE = interp_mips.js
 .PHONY: all clean
 all: $(EXE)
 
-$(EXE): $(OBJ)
-	$(CXX) $(CXXFLAGS) $(EMFLAGS) $(PRELOAD) $(OBJ) -o $(EXE)
+$(EXE): $(OBJ) $(SF_LIB) $(CHD_WLIB)
+	$(CXX) $(CXXFLAGS) $(EMFLAGS) $(PRELOAD) $(OBJ) $(SF_LIB) $(CHD_WLIBS) -o $(EXE)
+
+# Build the wasm libchdr static libs via its own CMake (emcmake), zstd single-threaded.
+$(CHD_WLIB):
+	emcmake cmake -S libchdr -B $(CHD_WBUILD) -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release \
+	  -DWITH_SYSTEM_ZLIB=OFF -DZSTD_MULTITHREAD_SUPPORT=OFF -DZSTD_BUILD_SHARED=OFF -DZSTD_BUILD_PROGRAMS=OFF
+	cmake --build $(CHD_WBUILD) -j4
+
+$(ODIR)/chd_reader.o: chd_reader.cc | $(ODIR) $(BOOST_SHIM)
+	$(CXX) -MMD $(CXXFLAGS) -Ilibchdr/include -c $< -o $@
 
 githash.cc: .git/HEAD .git/index
 	echo "const char *githash = \"$(shell git rev-parse HEAD)\";" > $@
 
-%.o: %.cc
-	$(CXX) -MMD $(CXXFLAGS) -c $<
+$(ODIR):
+	mkdir -p $(ODIR)
+
+$(BOOST_SHIM):
+	mkdir -p $(BOOST_SHIM)
+	ln -sf $(BOOST_SYS) $(BOOST_SHIM)/boost
+
+$(ODIR)/%.o: %.cc | $(ODIR) $(BOOST_SHIM)
+	$(CXX) -MMD $(CXXFLAGS) -c $< -o $@
 
 -include $(DEP)
 
 clean:
-	rm -rf interp_mips.js interp_mips.wasm interp_mips.data $(OBJ) $(DEP)
+	rm -rf interp_mips.js interp_mips.wasm interp_mips.data $(ODIR) $(SF_ODIR) $(BOOST_SHIM)
