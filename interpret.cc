@@ -1062,7 +1062,13 @@ static void raise_tlb(state_t *s, uint64_t va, uint32_t exccode,
 static const int UTLB_SZ = 64;          /* power of two */
 struct utlb_entry { uint64_t vpn, asid; uint32_t ppn; bool dirty, valid, cached; };
 static utlb_entry g_utlb[UTLB_SZ];
-static inline void utlb_flush() { for(auto &e : g_utlb) e.valid = false; }
+/* Fetch-page cache (interp_rv64's same-page trick): the last instruction-fetch page's
+ * translation.  A hit needs the same VA page, ASID and Status, so exceptions/ERET/mtc0
+ * Status/EntryHi changes miss by construction; only TLB writes must flush it. */
+static bool g_fc_valid = false;
+static uint64_t g_fc_vpage = 0, g_fc_asid = 0;
+static uint32_t g_fc_sr = 0, g_fc_ppage = 0;
+static inline void utlb_flush() { for(auto &e : g_utlb) e.valid = false; g_fc_valid = false; }
 
 /* TLBDUP (env-gated): after a TLBWI/TLBWR installs entry `idx`, scan for ANOTHER
  * slot that ALSO matches on VPN2[39:13]+R[63:62]+(ASID or both-Global), with both
@@ -3356,8 +3362,23 @@ void execMips(state_t *s) {
   sparse_mem &mem = s->mem;
   s->gpr[0] = 0;   /* MIPS $0 is hardwired to zero; e.g. `mflo $0` must not stick */
   s->tlb_fault = false;
-  uint32_t ipa = va_translate(s, (uint64_t)s->pc, tlb_op::fetch);
-  if(s->tlb_fault) return;   /* instruction-fetch TLB miss -> vectored */
+  uint32_t ipa;
+  const uint64_t f_vpage = (uint64_t)s->pc >> 12;
+  const uint64_t f_asid = s->cpr0_64[CPR0_ENTRYHI] & 0xffULL;
+  if(g_fc_valid && f_vpage == g_fc_vpage && f_asid == g_fc_asid && s->cpr0[CPR0_SR] == g_fc_sr) {
+    ipa = g_fc_ppage | (uint32_t)(s->pc & 0xfffULL);
+    s->mem.cache_active = false;   /* as va_translate does: fetches are uncached in cache_model */
+  }
+  else {
+    ipa = va_translate(s, (uint64_t)s->pc, tlb_op::fetch);
+    if(s->tlb_fault) return;   /* instruction-fetch TLB miss -> vectored */
+    /* UITLBSTATS models every fetch, so it keeps the cache off */
+    g_fc_valid = (g_uitlb_interval == 0);
+    g_fc_vpage = f_vpage;
+    g_fc_asid = f_asid;
+    g_fc_sr = s->cpr0[CPR0_SR];
+    g_fc_ppage = ipa & ~0xfffu;
+  }
   uint32_t inst = bswap<EL>(mem.get<uint32_t>(ipa));
   { static const bool g_dis = getenv("DISPROBE") != nullptr;
     static uint32_t seen[128]; static int nseen=0;

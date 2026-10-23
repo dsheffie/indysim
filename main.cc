@@ -292,12 +292,21 @@ int main(int argc, char *argv[]) {
   signal(SIGUSR1, on_sigusr1);   /* kill -USR1 <pid> -> dump current IRIX process */
   signal(SIGUSR2, on_sigusr2);   /* kill -USR2 <pid> -> flush --disk-delta sidecar */
   if(gdb_port) s->gdb = new gdb_stub(gdb_port);
+#ifdef ENABLE_COSIM
   if(cosim == "server")      cosim_init(true);
   else if(cosim == "client") cosim_init(false);
   const char *mnenv = getenv("COSIM_MEMN");
   uint64_t cosim_memn = mnenv ? strtoull(mnenv, nullptr, 0) : 4000000;  /* co-sim RAM-hash interval */
   const char *msenv = getenv("COSIM_MEMSTART");
   uint64_t cosim_memstart = msenv ? strtoull(msenv, nullptr, 0) : 0;
+#else
+  /* lockstep co-sim costs a call + CP0 snapshot per instruction: compiled out unless
+   * built with -DENABLE_COSIM */
+  if(!cosim.empty()) {
+    fprintf(stderr, "--cosim needs a build with -DENABLE_COSIM\n");
+    return -1;
+  }
+#endif
   { const char *e;   /* memory-op watchpoints (see sparse_mem.hh) */
     if((e = getenv("WATCHPA")))   g_watch_pa   = (uint32_t)strtoull(e, 0, 0);
     if((e = getenv("WATCHLDPC"))) g_watch_ldpc = (uint32_t)strtoull(e, 0, 0);
@@ -437,6 +446,7 @@ int main(int argc, char *argv[]) {
       fwrite(&valt_pc,8,1,dft); fwrite(&df_inst,4,1,dft);
       fwrite(&dvalid,1,1,dft);  fwrite(&ddst,1,1,dft); fwrite(&dval,8,1,dft);
     }
+#ifdef ENABLE_COSIM
     uint64_t mh = COSIM_NO_HASH;
     if(cosim_active() && s->icnt >= cosim_memstart && (s->icnt % cosim_memn) == 0) {
       const uint64_t *w = reinterpret_cast<const uint64_t*>(s->mem.mem + 0x08000000u);
@@ -447,12 +457,15 @@ int main(int argc, char *argv[]) {
     uint32_t cp0dbg[4] = { s->cpr0[CPR0_CAUSE], s->cpr0[CPR0_SR],
                            s->cpr0[CPR0_COUNT], s->cpr0[CPR0_EPC] };
     if(cosim_step(s->icnt, (int64_t)s->pc, (const int64_t*)s->gpr, mh, cp0dbg)) break;   /* lockstep co-sim */
+#endif
   }
+#ifdef ENABLE_COSIM
   if(cosim_active()) {   /* COSIM_RAMDUMP=<file>: dump low DRAM at the stop point to diff */
     const char *rd = getenv("COSIM_RAMDUMP");
     if(rd) { FILE *f = fopen(rd, "wb"); if(f) { fwrite(s->mem.mem + 0x08000000u, 1, 0x10000000u, f); fclose(f);
       fprintf(stderr, "[cosim] dumped low DRAM to %s at icnt=%lu\n", rd, (unsigned long)s->icnt); } }
   }
+#endif
   t0 = timestamp() - t0;
 
   if(s->scsi) s->scsi->flush_delta();   /* persist COW overlay on clean exit (no-op without --disk-delta) */
