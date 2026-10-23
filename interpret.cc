@@ -384,6 +384,24 @@ void maybe_take_interrupt(state_t *s) {
   { static const unsigned long g_pcs = getenv("PCSAMPLE") ? strtoul(getenv("PCSAMPLE"),0,0) : 0;
     if(g_pcs && (s->icnt % g_pcs) == 0)
       fprintf(stderr, "[pcsample] icnt=%llu pc=%08x\n", (unsigned long long)s->icnt, (uint32_t)s->pc); }
+  /* SASH_WATCH: one-shot dump of the environment the PROM hands sash -- the first
+   * fetch in sash's link region (0x10000000..), with Status/sp/ARCS args + the TLB. */
+  { static const bool g_sashw = getenv("SASH_WATCH") != nullptr;
+    static bool sashw_fired = false;
+    if(g_sashw && !sashw_fired && (uint32_t)s->pc >= 0x10000000u && (uint32_t)s->pc < 0x10100000u) {
+      sashw_fired = true;
+      fprintf(stderr, "[sashwatch] first sash fetch pc=%08x icnt=%llu Status=%08x sp=%08x ra=%08x "
+                      "a0=%08x a1=%08x a2=%08x a3=%08x\n",
+              (uint32_t)s->pc, (unsigned long long)s->icnt, s->cpr0[12], (uint32_t)s->gpr[29],
+              (uint32_t)s->gpr[31], (uint32_t)s->gpr[4], (uint32_t)s->gpr[5],
+              (uint32_t)s->gpr[6], (uint32_t)s->gpr[7]);
+      for(int i = 0; i < state_t::NUM_TLB_ENTRIES; i++) {
+        if(s->tlb[i].entry_hi == 0 && s->tlb[i].entry_lo0 == 0 && s->tlb[i].entry_lo1 == 0) { continue; }
+        fprintf(stderr, "[sashwatch] tlb[%2d] hi=%016llx lo0=%016llx lo1=%016llx pm=%08x\n", i,
+                (unsigned long long)s->tlb[i].entry_hi, (unsigned long long)s->tlb[i].entry_lo0,
+                (unsigned long long)s->tlb[i].entry_lo1, s->tlb[i].page_mask);
+      }
+    } }
   if(s->scc) s->scc->tick(1);                          /* serial TX timing: keep exact */
   if(__builtin_expect(s->icnt >= s->gfx_next_icnt, 0)) {
     newport_retrace(s);                                /* Newport vertical retrace timer */
@@ -1079,6 +1097,85 @@ static void iss_tlbdup_check(state_t *s, uint32_t idx, const char *how) {
 }
 
 
+static const uint64_t g_uitlb_interval = getenv("UITLBSTATS") ? strtoull(getenv("UITLBSTATS"), nullptr, 0) : 0;
+struct uitlb_ent_t { uint64_t vpn2, pm, r, asid; bool g, valid; };
+struct uitlb_model_t {
+  int n;
+  uitlb_ent_t e[16];
+  uint8_t lfsr;
+  uint64_t hit, miss, miss_user;
+};
+static uitlb_model_t g_uitlb[4] = {{2, {}, 0x5a, 0, 0, 0}, {4, {}, 0x5a, 0, 0, 0},
+                                   {8, {}, 0x5a, 0, 0, 0}, {16, {}, 0x5a, 0, 0, 0}};
+static uint64_t g_uitlb_asid = ~0ULL, g_uitlb_next = 0, g_uitlb_fetch = 0, g_uitlb_fetch_user = 0;
+static void uitlb_model_flush() {
+  for(auto &m : g_uitlb) {
+    for(int i = 0; i < m.n; i++) {
+      m.e[i].valid = false;
+    }
+  }
+}
+static void uitlb_model_fetch(state_t *s, uint64_t va, uint64_t cur_asid) {
+  if(cur_asid != g_uitlb_asid) {
+    uitlb_model_flush();
+    g_uitlb_asid = cur_asid;
+  }
+  const bool user = (va >> 31) == 0;
+  g_uitlb_fetch++;
+  if(user) {
+    g_uitlb_fetch_user++;
+  }
+  const uint64_t vpn2 = (va >> 13) & 0x7ffffffULL, r = (va >> 62) & 3;
+  for(auto &m : g_uitlb) {
+    m.lfsr = (uint8_t)((m.lfsr << 1) | (((m.lfsr >> 7) ^ (m.lfsr >> 5) ^ (m.lfsr >> 4) ^ (m.lfsr >> 3)) & 1));
+    bool h = false;
+    for(int i = 0; i < m.n; i++) {
+      const uitlb_ent_t &u = m.e[i];
+      if(u.valid && (((u.vpn2 ^ vpn2) & ~u.pm & 0x7ffffffULL) == 0) && u.r == r && (u.asid == cur_asid || u.g)) {
+        h = true;
+        break;
+      }
+    }
+    if(h) {
+      m.hit++;
+      continue;
+    }
+    m.miss++;
+    if(user) {
+      m.miss_user++;
+    }
+    /* install from the 48-way (same Sail match as va_translate_inner) */
+    for(int i = 0; i < state_t::NUM_TLB_ENTRIES; i++) {
+      const uint64_t pm = s->tlb[i].page_mask & 0x1ffe000ULL;
+      const uint64_t vpnMask = (~(uint64_t)(pm | 0x1fffULL)) & 0x000000ffffffe000ULL;
+      const uint64_t e_hi = s->tlb[i].entry_hi;
+      const bool g = (s->tlb[i].entry_lo0 & 1u) && (s->tlb[i].entry_lo1 & 1u);
+      if(((va & vpnMask) == (e_hi & vpnMask)) && (((va >> 62) & 3) == ((e_hi >> 62) & 3)) &&
+         (g || cur_asid == (e_hi & 0xffULL))) {
+        uitlb_ent_t &u = m.e[m.lfsr % m.n];
+        u.vpn2 = (e_hi >> 13) & 0x7ffffffULL;
+        u.pm = pm >> 13;
+        u.r = (e_hi >> 62) & 3;
+        u.asid = e_hi & 0xffULL;
+        u.g = g;
+        u.valid = true;
+        break;
+      }
+    }
+  }
+  if(s->icnt >= g_uitlb_next) {
+    g_uitlb_next = s->icnt + g_uitlb_interval;
+    fprintf(stderr, "[uitlb] icnt %llu mapped_fetch %llu (user %llu)", (unsigned long long)s->icnt,
+            (unsigned long long)g_uitlb_fetch, (unsigned long long)g_uitlb_fetch_user);
+    for(const auto &m : g_uitlb) {
+      fprintf(stderr, " | NU%d miss %llu (user %llu) hit%% %.3f mpki %.3f", m.n,
+              (unsigned long long)m.miss, (unsigned long long)m.miss_user,
+              100.0 * m.hit / (double)(m.hit + m.miss), 1000.0 * m.miss / (double)s->icnt);
+    }
+    fprintf(stderr, "\n");
+  }
+}
+
 static uint32_t va_translate_inner(state_t *s, uint64_t va, tlb_op op) {
   uint32_t hi32 = (uint32_t)(va >> 32);
   uint32_t lo32 = (uint32_t)va;
@@ -1163,6 +1260,15 @@ static uint32_t va_translate_inner(state_t *s, uint64_t va, tlb_op op) {
    * addressing (VA upper bits not a sign-extended 32-bit value). */
   bool xtlb = !(hi32 == 0x00000000u || hi32 == 0xffffffffu);
   uint64_t cur_asid = s->cpr0_64[CPR0_ENTRYHI] & 0xffULL;
+
+  /* UITLBSTATS=<interval insns>: count-only model of the r9999 RTL micro-ITLB
+   * (itlb.sv: NU-entry fully-assoc, VPN2/PageMask/R/ASID|G match, LFSR-random
+   * install from the 48-way on a miss, flushed on tlbwi/tlbwr and ASID change)
+   * at NU = 2/4/8/16 side by side.  Counts per fetched instruction; the miss
+   * count does not depend on the RTL's lookup granularity. */
+  if(g_uitlb_interval && op == tlb_op::fetch) {
+    uitlb_model_fetch(s, va, cur_asid);
+  }
 
   /* micro-TLB fast path: a hit gives the PA without scanning the CAM. A store to
    * a cached-but-not-dirty page falls through to the CAM so it raises Modified. */
@@ -2269,20 +2375,17 @@ void _sdr(uint32_t inst, state_t *s) {
 }
 
 static inline char* get_open_string(sparse_mem &mem, uint32_t offset) {
+  /* read byte-by-byte: the string may span pages, and the wasm backing is paged
+   * so a single get_raw_ptr is only valid within one 4 KiB page. */
   size_t len = 0;
-  char *ptr = reinterpret_cast<char*>(mem.get_raw_ptr(offset));
-  char *buf = nullptr;
-  while(*ptr != '\0') {
-    ptr++;
+  while(*mem.get_raw_ptr(offset + len) != '\0') {
     len++;
   }
-  buf = new char[len+1];
-  memset(buf, 0, len+1);
-  ptr = reinterpret_cast<char*>(mem.get_raw_ptr(offset));
+  char *buf = new char[len+1];
   for(size_t i = 0; i < len; i++) {
-    buf[i] = *ptr;
-    ptr++;
+    buf[i] = (char)*mem.get_raw_ptr(offset + i);
   }
+  buf[len] = '\0';
   return buf;
 }
 
@@ -4050,6 +4153,7 @@ void execMips(state_t *s) {
 	    iss_tlbdup_check(s, idx, "tlbwi");
 	  }
 	  utlb_flush();   /* mapping changed -> drop the micro-TLB */
+	  uitlb_model_flush();
 	  static const bool tlblog = getenv("TLBLOG") != nullptr;
 	  if(tlblog) fprintf(stderr, "[TLBWI] idx=%2u hi=%016llx lo0=%016llx lo1=%016llx pm=%08x\n",
 	     idx, (unsigned long long)s->cpr0_64[CPR0_ENTRYHI], (unsigned long long)s->cpr0_64[CPR0_ENTRYLO0],
@@ -4071,6 +4175,7 @@ void execMips(state_t *s) {
 	    iss_tlbdup_check(s, idx, "tlbwr");
 	  }
 	  utlb_flush();   /* mapping changed -> drop the micro-TLB */
+	  uitlb_model_flush();
 	  /* Decrement Random, wrap to NUM_TLB_ENTRIES-1 when it reaches Wired */
 	  {
 	    uint32_t wired  = s->cpr0[CPR0_WIRED] & 63;

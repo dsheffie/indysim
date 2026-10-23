@@ -46,11 +46,20 @@ void ramcap_log(char rw, uint32_t addr) {
 #endif
 
 sparse_mem::sparse_mem() {
+#ifdef __EMSCRIPTEN__
+  /* wasm32: flat low window (fast hot path) + on-demand page directory for the
+   * high sizing aperture (8 MiB of pointers; 4 KiB pages calloc'd on first touch). */
+  mem = reinterpret_cast<uint8_t*>(calloc(flat_sz, 1));
+  assert(mem != nullptr);
+  pages = reinterpret_cast<uint8_t**>(calloc(npages, sizeof(uint8_t*)));
+  assert(pages != nullptr);
+#else
   void* mempt = mmap(nullptr, sparse_mem::sz, PROT, MAP, -1, 0);
   mem = reinterpret_cast<uint8_t*>(mempt);
   assert(mem != reinterpret_cast<uint8_t*>(~0UL));
   assert(madvise(mem, 1UL<<32, MADV_DONTNEED)==0);
   //memset(mem, 0, sparse_mem::sz);
+#endif
 #ifdef ENABLE_O32_TRACE
   g_ramcap = getenv("RAMCAP") != nullptr;
   g_wrtrack = getenv("WRTRACK") != nullptr;
@@ -65,11 +74,27 @@ sparse_mem::sparse_mem() {
 }
 
 sparse_mem::~sparse_mem() {
+#ifdef __EMSCRIPTEN__
+  if(pages) {
+    for(uint64_t i = 0; i < npages; i++) { free(pages[i]); }
+    free(pages);
+    pages = nullptr;
+  }
+  free(mem); mem = nullptr;
+#else
   munmap(mem, sz);
   mem = nullptr;
+#endif
 }
 
 void sparse_mem::clear() {
+#ifdef __EMSCRIPTEN__
+  /* re-zero the flat low window; free every committed high page */
+  memset(mem, 0, flat_sz);
+  for(uint64_t i = 0; i < npages; i++) {
+    if(pages[i]) { free(pages[i]); pages[i] = nullptr; }
+  }
+#else
   if(mem) {
     munmap(mem, sz);
   }
@@ -77,6 +102,7 @@ void sparse_mem::clear() {
   mem = reinterpret_cast<uint8_t*>(mempt);
   assert(mem != reinterpret_cast<uint8_t*>(~0UL));
   assert(madvise(mem, 1UL<<32, MADV_DONTNEED)==0);
+#endif
 }
 
 #if 0
@@ -267,7 +293,7 @@ template <typename T> T sparse_mem::route_load(uint64_t pa) {
   case mem_range_t::hpc_regs: return static_cast<T>(st->hpc->read(pa & 0x7ffff, sizeof(T)));
   default:
     if(unclaimed_log) { g_unclaimed.note(r, pa, false); }
-    return *reinterpret_cast<T*>(mem+pa);
+    return *reinterpret_cast<T*>(backing(pa));
   }
 }
 template <typename T> void sparse_mem::route_store(uint64_t pa, T v) {
@@ -285,7 +311,7 @@ template <typename T> void sparse_mem::route_store(uint64_t pa, T v) {
   default:
     if(unclaimed_log) { g_unclaimed.note(r, pa, true); }
     if((pa & ~0xfffULL) == 0x1fd00000ULL && v != 0) st->brk = 1;
-    *reinterpret_cast<T*>(mem+pa) = v;
+    *reinterpret_cast<T*>(backing(pa)) = v;
     break;
   }
 }

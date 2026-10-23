@@ -6,9 +6,11 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 
+#ifndef __EMSCRIPTEN__
 #define UNW_LOCAL_ONLY
 #include <libunwind.h>
 #include <cxxabi.h>
+#endif
 
 #ifdef __amd64__
 #include <x86intrin.h>

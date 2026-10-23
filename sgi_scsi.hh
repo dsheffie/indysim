@@ -9,6 +9,7 @@
 
 struct state_t;
 class qcow2_reader;
+class chd_reader;
 
 /*
  * Fused WD33C93A SCSI controller + single disk target (behavioral model).
@@ -35,6 +36,7 @@ private:
   state_t *s;
   int      fd = -1;                 /* raw disk image (read-only, or O_RDWR if direct_write) */
   qcow2_reader *qcow = nullptr;     /* non-null when the image is qcow2 (read-only, under the overlay) */
+  chd_reader   *chd  = nullptr;     /* non-null when the image is a MAME CHD (read-only, under the overlay) */
   bool     direct_write = false;    /* --disk-write: writes go straight to the image, no COW */
   uint64_t nblocks = 0;             /* 512-byte block count */
   uint8_t  regs[0x20] = {0};        /* WD33C93 register file 0x00..0x1f */

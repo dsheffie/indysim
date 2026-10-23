@@ -156,9 +156,14 @@ void load_elf(const char* fn, state_t *ms) {
       
       
       /* not strictly required, prefault fills with zeros */
+#ifndef __EMSCRIPTEN__
+      /* zeroes at the RAW kseg0 vaddr (~0x88xxxxxx). Harmless on the 4 GiB map,
+       * but out of bounds on the web build's 512 MiB calloc -- and redundant
+       * there anyway, since calloc already zeroed the whole (physical) map. */
       for(int32_t cc = 0; cc < p_memsz; cc++) {
 	mem.set<uint8_t>(cc+p_vaddr, 0);
       }
+#endif
       
       for(int32_t cc = 0; cc < p_filesz; cc++) {
 	uint32_t v_addr = cc+p_vaddr;

@@ -54,8 +54,39 @@ public:
   static const uint64_t pgsize = 4096;
   /* 1ULL, not 1UL: unsigned long is 32 bits on 32-bit targets (wasm32, i386),
    * where 1UL<<32 is undefined and rejects as a non-constant initializer. */
-  static const uint64_t sz = 1ULL<<32;  
-  uint8_t *mem = nullptr;
+  static const uint64_t sz = 1ULL<<32;
+  /* native: a single MAP_NORESERVE mmap over the whole 4 GiB space, pages committed
+   * lazily by the OS.  wasm32 can neither reserve nor commit a flat 4 GiB map, so it
+   * backs memory with an on-demand PAGE DIRECTORY instead (pages[] below): only pages
+   * the guest actually touches cost memory.  This also lets the real SGI PROM's memory
+   * sizing reach its test aperture at phys 0x20000000, which overflowed the old 512 MiB
+   * flat wasm cap and made the PROM report "No usable memory found". */
+  uint8_t *mem = nullptr;          /* native: 4 GiB mmap.  wasm: flat low window [0,flat_sz) */
+#ifdef __EMSCRIPTEN__
+  /* Hybrid backing: a flat calloc covers the low window [0, flat_sz) -- all RAM
+   * (0x08000000+256M), the low MC alias, the device window and the PROM @0x1fc00000,
+   * i.e. every hot access -- so execution and the PROM memory test run at flat speed.
+   * Only addresses >= flat_sz (the real PROM's memory-sizing aperture at 0x20000000,
+   * which the pure-512MiB-cap build dropped -> "No usable memory found") go through an
+   * on-demand page directory, costing memory only for pages actually touched. */
+  static const uint64_t flat_sz = 0x20000000ULL;   /* 512 MiB flat low window */
+  static const uint64_t npages  = sz / pgsize;      /* page dir covers the full 4 GiB */
+  uint8_t **pages = nullptr;
+  inline uint8_t *page_byte(uint64_t a) {           /* only called for a >= flat_sz */
+    uint8_t *&pg = pages[a / pgsize];
+    if(pg == nullptr) { pg = reinterpret_cast<uint8_t*>(calloc(1, pgsize)); }
+    return pg + (a % pgsize);
+  }
+#endif
+  /* backing byte for an already-routed physical address (flat on native; flat low
+   * window + paged high aperture on wasm) */
+  inline uint8_t *backing(uint64_t a) {
+#ifdef __EMSCRIPTEN__
+    return (a < flat_sz) ? (mem + a) : page_byte(a);
+#else
+    return mem + a;
+#endif
+  }
   state_t *st = nullptr;
   bool route_devices = false;
   /* set per-access by va_translate: true only for a CACHED cpu load/store (kseg0
@@ -68,11 +99,12 @@ public:
   void clear();
 
   uint8_t * operator[](uint64_t addr) {
-    return &mem[addr];
+    return backing(addr);
   }
   uint8_t * operator+(uint64_t disp) {
     return (*this)[disp];
   }
+#ifndef __EMSCRIPTEN__
   bool compare(const sparse_mem &other, bool verbose = false) {
     bool error = false;
     for(uint64_t b = 0; b < sz; ++b) {
@@ -91,6 +123,7 @@ public:
     }
     return error;
   }
+#endif
   /* MC "System Memory Alias" (mc.pdf p.22): physical 0x0..0x7ffff is a hard
    * alias of DRAM 0x08000000..0x0807ffff -- main local memory lives at phys
    * 0x08000000, and the bottom 512 KB mirrors its base so the CPU exception
@@ -102,7 +135,7 @@ public:
   uint8_t *get_raw_ptr(uint64_t byte_addr) {
     byte_addr &= ((1ULL<<32) - 1);   /* 1ULL: 1UL<<32 is undefined on 32-bit targets */
     if(route_devices) byte_addr = mc_alias(byte_addr);
-    return mem+byte_addr;
+    return backing(byte_addr);
   }
   template <typename T>
   T get(uint64_t byte_addr) {
@@ -124,13 +157,13 @@ public:
       if(route_devices && !(byte_addr>=0x1f000000 && byte_addr<=0x1fffffff)) _ea = mc_alias(byte_addr);
       fprintf(stderr, "[ld] icnt=%lu pc=%08x ea=%08x val=%016llx sz=%zu\n",
               (unsigned long)g_cur_icnt, (uint32_t)g_cur_pc, (uint32_t)byte_addr,
-              (unsigned long long)(uint64_t)*reinterpret_cast<T*>(mem+_ea), sizeof(T));
+              (unsigned long long)(uint64_t)*reinterpret_cast<T*>(backing(_ea)), sizeof(T));
     }
     if(route_devices) {
       if(byte_addr>=0x1f000000 && byte_addr<=0x1fffffff) return route_load<T>(byte_addr);
       byte_addr = mc_alias(byte_addr);
     }
-    return *reinterpret_cast<T*>(mem+byte_addr);
+    return *reinterpret_cast<T*>(backing(byte_addr));
   }
   template<typename T>
   void set(uint64_t byte_addr, T v) {
@@ -161,7 +194,7 @@ public:
       if(byte_addr>=0x1f000000 && byte_addr<=0x1fffffff) { route_store<T>(byte_addr, v); return; }
       byte_addr = mc_alias(byte_addr);
     }
-    *reinterpret_cast<T*>(mem+byte_addr) = v;
+    *reinterpret_cast<T*>(backing(byte_addr)) = v;
   }
   template <typename T> T route_load(uint64_t pa);
   template <typename T> void route_store(uint64_t pa, T v);

@@ -8,7 +8,9 @@
 #include <array>
 #include <map>
 #include <string>
+#ifndef __EMSCRIPTEN__
 #include <capstone/capstone.h>
+#endif
 
 #include "disassemble.hh"
 
@@ -39,6 +41,7 @@ void disassemble(std::ostream &out, uint32_t inst, uint32_t addr) {
 }
 
 
+#ifndef __EMSCRIPTEN__
 static const std::map<cs_err, std::string> cs_error_map =
   {
    {CS_ERR_OK,"CS_ERR_OK"},
@@ -88,6 +91,13 @@ std::string getAsmString(uint32_t inst, uint32_t addr) {
   cs_free(insn, count);
   return ss.str();
 }
+#else
+/* emscripten: no capstone. The disassembler is a debug-only convenience; stub it
+ * so the web build links. getGPRName/getCondName/disassemble() above still work. */
+void initCapstone() {}
+void stopCapstone() {}
+std::string getAsmString(uint32_t inst, uint32_t addr) { return std::string(); }
+#endif
 
 
 

@@ -35,3 +35,22 @@ golden_*.bin
 g*.log
 iss_boot.log
 gin.txt
+
+# emscripten / wasm build (wasm branch)
+emcc_obj/
+sf_wasm_obj/
+boost_shim/
+guest/
+interp_mips.js
+interp_mips.wasm
+interp_mips.data
+
+# vendored libchdr: exclude our cmake output dirs only (keep upstream source)
+libchdr/build/
+libchdr/build-wasm/
+
+# newport frame dumps (scratch)
+*.ppm
+
+# built helper tools (sources tools/*.cc are tracked)
+tools/np_replay

@@ -1,5 +1,6 @@
 #include "sgi_scsi.hh"
 #include "qcow2_reader.hh"
+#include "chd_reader.hh"
 #include "interpret.hh"
 #include <cstdio>
 #include <cstdlib>
@@ -44,11 +45,29 @@ sgi_scsi::sgi_scsi(state_t *s, const std::string &disk_path, const std::string &
   }
   fd = disk_path.empty() ? -1 : open(disk_path.c_str(), direct_write ? O_RDWR : O_RDONLY);
   if(fd >= 0) {
-    /* qcow2? peek the magic; if so, parse it and size the disk from the qcow2
-     * virtual size.  The reader is read-only -- writes go through the COW overlay
-     * / --disk-delta like a read-only raw image -- so --disk-write is rejected. */
-    uint8_t magic[4];
-    if(pread(fd, magic, 4, 0) == 4 && qcow2_reader::is_magic(magic)) {
+    /* qcow2 or MAME CHD? peek the magic; if so, parse it and size the disk from
+     * the image's virtual size.  Both readers are read-only -- writes go through
+     * the COW overlay / --disk-delta like a read-only raw image -- so --disk-write
+     * is rejected.  CHD's magic is 8 bytes ("MComprHD"); qcow2's is the first 4. */
+    uint8_t magic[8];
+    ssize_t mg = pread(fd, magic, 8, 0);
+    if(mg == 8 && chd_reader::is_magic(magic)) {
+      chd = new chd_reader();
+      if(chd->open(fd)) {
+        nblocks = chd->virtual_size() / 512;
+        if(this->direct_write) {
+          fprintf(stderr, "sgi_scsi: --disk-write is not supported on a CHD image; "
+                          "writes go to the in-memory overlay (use --disk-delta to persist)\n");
+          this->direct_write = false;
+          direct_write = false;
+        }
+      } else {
+        fprintf(stderr, "sgi_scsi: '%s' is a CHD but unsupported -- modeling an empty bus\n",
+                disk_path.c_str());
+        delete chd; chd = nullptr;
+        close(fd); fd = -1;
+      }
+    } else if(mg >= 4 && qcow2_reader::is_magic(magic)) {
       qcow = new qcow2_reader();
       if(qcow->open(fd)) {
         nblocks = qcow->virtual_size() / 512;
@@ -127,7 +146,7 @@ void sgi_scsi::flush_delta() const {
   fprintf(stderr, "sgi_scsi: wrote %zu delta blocks to '%s'\n", overlay.size(), delta_path.c_str());
 }
 
-sgi_scsi::~sgi_scsi() { delete qcow; if(fd >= 0) close(fd); }
+sgi_scsi::~sgi_scsi() { delete qcow; delete chd; if(fd >= 0) close(fd); }
 
 void sgi_scsi::reset() {
   SPRINTF("sgi_scsi: reset() called @icnt=%llu (intrq->false)\n", (unsigned long long)s->icnt);
@@ -141,6 +160,7 @@ void sgi_scsi::block_read(uint64_t lba, uint8_t *dst) {
   if(it != overlay.end()) { memcpy(dst, it->second.data(), 512); return; }
   if(lba >= nblocks) { memset(dst, 0, 512); return; }
   if(qcow) { qcow->read_block(lba, dst); return; }   /* qcow2 backing (read-only) */
+  if(chd)  { chd->read_block(lba, dst);  return; }   /* MAME CHD backing (read-only) */
   ssize_t n = pread(fd, dst, 512, (off_t)(lba * 512));
   if(n != 512) memset(dst, 0, 512);
 }

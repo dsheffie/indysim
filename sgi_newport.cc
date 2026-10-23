@@ -28,7 +28,9 @@
 #include <map>
 #include <string>
 #include "sgi_newport.hh"
-#include "newport_sdl.hh"
+#ifndef __EMSCRIPTEN__
+#include "newport_sdl.hh"       /* SDL display front-end; omitted from the web build */
+#endif
 #include "sgi_ps2.hh"
 #include "interpret.hh"
 
@@ -535,9 +537,11 @@ void sgi_newport::vblank(uint64_t icnt) {
     vrint_line = true;
     s->irq_poke = true;
   }
+#ifndef __EMSCRIPTEN__
   if(disp) {
-    disp->pump();
+    disp->pump();                /* SDL display pump; the web build drives render() from its own loop */
   }
+#endif
   if(s->ps2) {
     s->ps2->service(icnt);
   }

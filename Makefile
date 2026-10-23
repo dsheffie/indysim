@@ -1,6 +1,6 @@
 UNAME_S = $(shell uname -s)
 
-OBJ = main.o pseudo_bios.o loadelf.o disassemble.o helper.o interpret.o sparse_mem.o cache_model.o sgi_mc.o sgi_hpc.o sgi_scc.o sgi_scsi.o qcow2_reader.o sgi_seeq.o saveState.o gdbstub.o githash.o shmem.o cosim.o sgi_newport.o newport_sdl.o sgi_ps2.o
+OBJ = main.o pseudo_bios.o loadelf.o disassemble.o helper.o interpret.o sparse_mem.o cache_model.o sgi_mc.o sgi_hpc.o sgi_scc.o sgi_scsi.o qcow2_reader.o chd_reader.o sgi_seeq.o saveState.o gdbstub.o githash.o shmem.o cosim.o sgi_newport.o newport_sdl.o sgi_ps2.o
 
 ifeq ($(UNAME_S),Linux)
 	CXX = clang++-20 -march=native -flto
@@ -39,22 +39,39 @@ EXE = interp_mips
 SF_BUILD = softfloat/build/Linux-x86_64-GCC
 SF_LIB   = $(SF_BUILD)/softfloat.a
 
+# Vendored libchdr (./libchdr) -- read MAME CHD disk images (chd_reader.cc).  Built
+# by its own CMake into static libs (libchdr + its bundled zlib/lzma/zstd); linked
+# whole.  libchdr-static references the dep libs, so it is listed before them.
+CHD_BUILD = libchdr/build
+CHD_LIB   = $(CHD_BUILD)/libchdr-static.a
+CHD_LIBS  = $(CHD_LIB) \
+            $(CHD_BUILD)/deps/zlib-1.3.1/libz.a \
+            $(CHD_BUILD)/deps/lzma-24.05/liblzma.a \
+            $(CHD_BUILD)/deps/zstd-1.5.6/build/cmake/lib/libzstd.a
+
 .PHONY : all clean
 
 # Newport tools: whole-trace replay (NEWPORT_TRACE) and the per-GO oracle (NEWPORT_DRAWCAP)
 NP_TOOL_OBJ = $(filter-out main.o,$(OBJ))
-tools/np_replay: tools/np_replay.cc $(NP_TOOL_OBJ) $(SF_LIB)
-	$(CXX) $(CXXFLAGS) $< $(NP_TOOL_OBJ) $(SF_LIB) $(LIBS) -o $@
-tools/np_goreplay: tools/np_goreplay.cc $(NP_TOOL_OBJ) $(SF_LIB)
-	$(CXX) $(CXXFLAGS) $< $(NP_TOOL_OBJ) $(SF_LIB) $(LIBS) -o $@
+tools/np_replay: tools/np_replay.cc $(NP_TOOL_OBJ) $(SF_LIB) $(CHD_LIB)
+	$(CXX) $(CXXFLAGS) $< $(NP_TOOL_OBJ) $(SF_LIB) $(CHD_LIBS) $(LIBS) -o $@
+tools/np_goreplay: tools/np_goreplay.cc $(NP_TOOL_OBJ) $(SF_LIB) $(CHD_LIB)
+	$(CXX) $(CXXFLAGS) $< $(NP_TOOL_OBJ) $(SF_LIB) $(CHD_LIBS) $(LIBS) -o $@
 
 all: $(EXE)
 
-$(EXE) : $(OBJ) $(SF_LIB)
-	$(CXX) $(CXXFLAGS) $(OBJ) $(SF_LIB) $(LIBS) -o $(EXE)
+$(EXE) : $(OBJ) $(SF_LIB) $(CHD_LIB)
+	$(CXX) $(CXXFLAGS) $(OBJ) $(SF_LIB) $(CHD_LIBS) $(LIBS) -o $(EXE)
 
 $(SF_LIB):
 	$(MAKE) -C $(SF_BUILD)
+
+$(CHD_LIB):
+	cmake -S libchdr -B $(CHD_BUILD) -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release -DWITH_SYSTEM_ZLIB=OFF
+	cmake --build $(CHD_BUILD) -j4
+
+chd_reader.o: chd_reader.cc
+	$(CXX) -MMD $(CXXFLAGS) -Ilibchdr/include -c $<
 
 githash.cc : .git/HEAD .git/index
 	echo "const char *githash = \"$(shell git rev-parse HEAD)\";" > $@
