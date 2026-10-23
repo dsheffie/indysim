@@ -1,3 +1,4 @@
 *.o
 *.d
 build/
+!deps/zstd-1.5.6/build/

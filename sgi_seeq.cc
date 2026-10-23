@@ -6,7 +6,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
-#ifndef __EMSCRIPTEN__
+#if !defined(__EMSCRIPTEN__) && defined(__linux__)
 #include <sys/ioctl.h>
 #include <linux/if.h>       /* host TAP networking; the web build has no host tap */
 #include <linux/if_tun.h>
@@ -53,11 +53,11 @@ sgi_seeq::sgi_seeq(state_t *s_, const std::string &tap_ifname) : s(s_) {
     fprintf(stderr, "sgi_seeq: no tap (set SEEQ_TAP=<ifname>); register model only\n");
     return;
   }
-#ifdef __EMSCRIPTEN__
-  /* web build: no host tap. Register model stays live (driver init / EDLC probe),
+#if defined(__EMSCRIPTEN__) || !defined(__linux__)
+  /* web/non-Linux build: no host tap. Register model stays live (driver init / EDLC probe),
    * just no real frame I/O -- same as the native no-SEEQ_TAP case. */
   (void)want;
-  fprintf(stderr, "sgi_seeq: web build, no host tap; register model only\n");
+  fprintf(stderr, "sgi_seeq: no host tap on this platform; register model only\n");
   return;
 #else
   int fd = ::open("/dev/net/tun", O_RDWR);

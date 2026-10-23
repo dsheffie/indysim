@@ -14,7 +14,7 @@ endif
 
 ifeq ($(UNAME_S),Darwin)
 	CXX = clang++ -march=native -I/opt/local/include
-	EXTRA_LD = -L/opt/local/lib -lboost_program_options-mt -lcapstone
+	EXTRA_LD = -L/opt/local/lib -lboost_program_options-mt -lboost_serialization-mt -lcapstone
 endif
 
 CXXFLAGS = -std=c++17 -g $(OPT)
@@ -51,14 +51,15 @@ CHD_LIBS  = $(CHD_LIB) \
 
 .PHONY : all clean
 
+# first rule = default goal
+all: $(EXE)
+
 # Newport tools: whole-trace replay (NEWPORT_TRACE) and the per-GO oracle (NEWPORT_DRAWCAP)
 NP_TOOL_OBJ = $(filter-out main.o,$(OBJ))
 tools/np_replay: tools/np_replay.cc $(NP_TOOL_OBJ) $(SF_LIB) $(CHD_LIB)
 	$(CXX) $(CXXFLAGS) $< $(NP_TOOL_OBJ) $(SF_LIB) $(CHD_LIBS) $(LIBS) -o $@
 tools/np_goreplay: tools/np_goreplay.cc $(NP_TOOL_OBJ) $(SF_LIB) $(CHD_LIB)
 	$(CXX) $(CXXFLAGS) $< $(NP_TOOL_OBJ) $(SF_LIB) $(CHD_LIBS) $(LIBS) -o $@
-
-all: $(EXE)
 
 $(EXE) : $(OBJ) $(SF_LIB) $(CHD_LIB)
 	$(CXX) $(CXXFLAGS) $(OBJ) $(SF_LIB) $(CHD_LIBS) $(LIBS) -o $(EXE)
