@@ -1420,9 +1420,10 @@ struct dfast_t {
   uint64_t vpage;
   uint64_t ctx1;                       /* context + 1; 0 = empty */
   uint32_t ppage;
+  uint32_t writable;                   /* a store translated here (TLB D bit was set) */
 };
 static const uint32_t DFAST_SZ = 256;
-static dfast_t g_dfast[3][DFAST_SZ];   /* [0] loads, [1] stores, [2] instruction fetch */
+static dfast_t g_dfast[2][DFAST_SZ];   /* [0] data (loads + stores), [1] instruction fetch */
 static const bool g_dfast_on = [](){
   static const char *knobs[] = {"DEVMAP", "ECCFG", "HEAP_PROBE", "HTRACE", "IDXWR", "MODLOG",
                                 "MODLOG_FLOOR", "NVLOG", "TLBDBG", "WATCHC4", "WATCHVA_ADDR"};
@@ -1447,13 +1448,14 @@ static inline uint32_t va_translate(state_t *s, uint64_t va, tlb_op op) {
     return va_translate_slow(s, va, op);     /* UITLBSTATS models every fetch */
   }
   const uint64_t vpage = va >> 12;
-  dfast_t &e = g_dfast[op == tlb_op::store ? 1 : (op == tlb_op::fetch ? 2 : 0)][vpage & (DFAST_SZ - 1)];
+  dfast_t &e = g_dfast[op == tlb_op::fetch][vpage & (DFAST_SZ - 1)];
   const uint64_t ctx1 = dfast_ctx(s) + 1;
-  if(__builtin_expect(e.vpage == vpage && e.ctx1 == ctx1, 1)) {
+  if(__builtin_expect(e.vpage == vpage && e.ctx1 == ctx1 && (op != tlb_op::store || e.writable), 1)) {
     return e.ppage | (uint32_t)(va & 0xfffULL);
   }
   const uint32_t pa = va_translate_slow(s, va, op);
   if(g_dfast_on && !s->tlb_fault && !g_mem_hooks && pa >= 0x08000000u && pa < 0x18000000u) {
+    e.writable = (op == tlb_op::store) || (e.vpage == vpage && e.ctx1 == ctx1 && e.writable);
     e.vpage = vpage;
     e.ctx1 = ctx1;
     e.ppage = pa & ~0xfffu;
