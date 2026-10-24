@@ -48,6 +48,7 @@ namespace globals {
   uint64_t icountMIPS = 0;
   uint64_t cycle = 0;
   bool trace_retirement = false;
+  bool exec_dbg = false;   /* no debug knobs in the browser: run execMips' fast instance */
   bool trace_fp = false;
   bool report_syscalls = false;
   retire_trace *retire_log = nullptr;
