@@ -1,1 +1,1 @@
-self.INDYSIM_BUILD = 'b2a4d3d 2026-10-24';
+self.INDYSIM_BUILD = 'bce719b 2026-10-24';
