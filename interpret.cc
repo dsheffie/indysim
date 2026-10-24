@@ -963,7 +963,8 @@ static utlb_entry g_utlb[UTLB_SZ];
 static bool g_fc_valid = false;
 static uint64_t g_fc_vpage = 0, g_fc_asid = 0;
 static uint32_t g_fc_sr = 0, g_fc_ppage = 0;
-static inline void utlb_flush() { for(auto &e : g_utlb) e.valid = false; g_fc_valid = false; }
+static inline void dfast_flush();
+static inline void utlb_flush() { for(auto &e : g_utlb) e.valid = false; g_fc_valid = false; dfast_flush(); }
 
 /* TLBDUP (env-gated): after a TLBWI/TLBWR installs entry `idx`, scan for ANOTHER
  * slot that ALSO matches on VPN2[39:13]+R[63:62]+(ASID or both-Global), with both
@@ -1370,7 +1371,7 @@ static uint32_t ip22_probe_window(state_t *s, uint32_t pa, tlb_op op) {
   return (op == tlb_op::store ? 0x2ffff000u : 0x2fffe000u) | (pa & 0xfffu);
 }
 
-static uint32_t va_translate(state_t *s, uint64_t va, tlb_op op) {
+static __attribute__((noinline)) uint32_t va_translate_slow(state_t *s, uint64_t va, tlb_op op) {
 #ifdef ENABLE_CACHE_MODEL
   if(g_wsprof && op == tlb_op::store) {                 /* WS profiler markers */
     uint32_t v32 = (uint32_t)va;
@@ -1403,6 +1404,59 @@ static uint32_t va_translate(state_t *s, uint64_t va, tlb_op op) {
    * TLB miss still takes precedence; stores are left alone (the GIO probe loads). */
   if(op == tlb_op::load && !s->tlb_fault && ip22_gio_bus_error(pa)) {
     raise_dbe(s);
+  }
+  return pa;
+}
+
+/* ---- software TLB for data accesses (Bedichek's figure 5) --------------------------
+ * A direct-mapped cache of successful load/store translations to plain RAM, separate
+ * for loads and stores (a store entry exists only after a store translated, i.e. the
+ * TLB D bit was set), keyed by virtual page + a context word (ASID and the SR mode
+ * bits, so ASID or mode changes simply miss).  Flushed with the micro-TLB on tlbwi/
+ * tlbwr.  Only RAM PAs are cached: the PROM probe window, GIO bus-error space and the
+ * device windows keep their side effects on the slow path.  Off entirely when any of
+ * the translation path's debug knobs or the memory hooks are active. */
+struct dfast_t {
+  uint64_t vpage;
+  uint64_t ctx1;                       /* context + 1; 0 = empty */
+  uint32_t ppage;
+};
+static const uint32_t DFAST_SZ = 256;
+static dfast_t g_dfast[2][DFAST_SZ];   /* [0] loads, [1] stores */
+static const bool g_dfast_on = [](){
+  static const char *knobs[] = {"DEVMAP", "ECCFG", "HEAP_PROBE", "HTRACE", "IDXWR", "MODLOG",
+                                "MODLOG_FLOOR", "NVLOG", "TLBDBG", "WATCHC4", "WATCHVA_ADDR"};
+  for(const char *k : knobs) {
+    if(getenv(k) != nullptr) {
+      return false;
+    }
+  }
+  return true;
+}();
+
+static inline uint64_t dfast_ctx(const state_t *s) {
+  return (s->cpr0_64[CPR0_ENTRYHI] & 0xffULL) | ((uint64_t)(s->cpr0[CPR0_SR] & 0xfeu) << 8);
+}
+
+static inline void dfast_flush() {
+  memset(g_dfast, 0, sizeof(g_dfast));
+}
+
+static inline uint32_t va_translate(state_t *s, uint64_t va, tlb_op op) {
+  if(op == tlb_op::fetch) {
+    return va_translate_slow(s, va, op);
+  }
+  const uint64_t vpage = va >> 12;
+  dfast_t &e = g_dfast[op == tlb_op::store][vpage & (DFAST_SZ - 1)];
+  const uint64_t ctx1 = dfast_ctx(s) + 1;
+  if(__builtin_expect(e.vpage == vpage && e.ctx1 == ctx1, 1)) {
+    return e.ppage | (uint32_t)(va & 0xfffULL);
+  }
+  const uint32_t pa = va_translate_slow(s, va, op);
+  if(g_dfast_on && !s->tlb_fault && !g_mem_hooks && pa >= 0x08000000u && pa < 0x18000000u) {
+    e.vpage = vpage;
+    e.ctx1 = ctx1;
+    e.ppage = pa & ~0xfffu;
   }
   return pa;
 }
