@@ -40,7 +40,7 @@ var ENVIRONMENT_IS_SHELL = !ENVIRONMENT_IS_WEB && !ENVIRONMENT_IS_NODE && !ENVIR
 
 // --pre-jses are emitted after the Module integration code, so that they can
 // refer to Module (if they choose; they can also define Module)
-// include: /tmp/tmphh6mcox7.js
+// include: /tmp/tmpnqmlcyg8.js
 
   if (!Module['expectedDataFileDownloads']) Module['expectedDataFileDownloads'] = 0;
   Module['expectedDataFileDownloads']++;
@@ -167,7 +167,7 @@ var ENVIRONMENT_IS_SHELL = !ENVIRONMENT_IS_WEB && !ENVIRONMENT_IS_NODE && !ENVIR
 
   })();
 
-// end include: /tmp/tmphh6mcox7.js
+// end include: /tmp/tmpnqmlcyg8.js
 
 
 var programArgs = [];
@@ -5105,6 +5105,7 @@ var stringToUTF8Array = (str, heap, outIdx, maxBytesToWrite) => {
 
 
 
+
   var getCFunc = (ident) => {
       var func = Module['_' + ident]; // closure exported function
       return func;
@@ -5244,6 +5245,7 @@ if (Module['printErr']) err = Module['printErr'];
 
 function web_post_frame(ptr,w,h) { if (typeof postMessage !== 'function') { return; } var bytes = HEAPU8.slice(ptr, ptr + w * h * 4); postMessage({ kind: 'frame', w: w, h: h, buf: bytes.buffer }, [bytes.buffer]); }
 function web_post_stat(icnt) { if (typeof postMessage === 'function') { postMessage({ kind: 'stat', icnt: icnt }); } }
+function web_post_build(hash) { if (typeof postMessage === 'function') { postMessage({ kind: 'build', hash: UTF8ToString(hash) }); } }
 
 // Imports from the Wasm binary.
 var __ZN5boost13serialization16singleton_module8get_lockEv,
@@ -5409,6 +5411,8 @@ var wasmImports = {
   /** @export */
   invoke_viiiiiiiiiiiiiii,
   /** @export */
+  web_post_build,
+  /** @export */
   web_post_frame,
   /** @export */
   web_post_stat
@@ -5418,6 +5422,17 @@ function invoke_iiii(index,a1,a2,a3) {
   var sp = stackSave();
   try {
     return getWasmTableEntry(index)(a1,a2,a3);
+  } catch(e) {
+    stackRestore(sp);
+    if (!(e instanceof EmscriptenEH)) throw e;
+    _setThrew(1, 0);
+  }
+}
+
+function invoke_vi(index,a1) {
+  var sp = stackSave();
+  try {
+    getWasmTableEntry(index)(a1);
   } catch(e) {
     stackRestore(sp);
     if (!(e instanceof EmscriptenEH)) throw e;
@@ -5440,17 +5455,6 @@ function invoke_ii(index,a1) {
   var sp = stackSave();
   try {
     return getWasmTableEntry(index)(a1);
-  } catch(e) {
-    stackRestore(sp);
-    if (!(e instanceof EmscriptenEH)) throw e;
-    _setThrew(1, 0);
-  }
-}
-
-function invoke_vi(index,a1) {
-  var sp = stackSave();
-  try {
-    getWasmTableEntry(index)(a1);
   } catch(e) {
     stackRestore(sp);
     if (!(e instanceof EmscriptenEH)) throw e;
