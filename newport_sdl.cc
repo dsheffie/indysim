@@ -78,7 +78,7 @@ newport_sdl::newport_sdl(sgi_newport *np, state_t *s) : np(np), s(s) {
     wh = (int)(h * sc);
   }
   /* ALLOW_HIGHDPI: render at the display's real pixel density (Retina = 2x points) */
-  SDL_Window *wn = SDL_CreateWindow("interp_mips Newport", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+  SDL_Window *wn = SDL_CreateWindow("indysim Newport", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                     ww, wh, SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
   if(wn == nullptr) {
     fprintf(stderr, "[newport] sdl: CreateWindow failed: %s\n", SDL_GetError());
@@ -123,8 +123,8 @@ void newport_sdl::set_grab(bool on) {
   if(!abs_mouse) {
     SDL_SetRelativeMouseMode(on ? SDL_TRUE : SDL_FALSE);
   }
-  SDL_SetWindowTitle((SDL_Window *)win, on ? "interp_mips Newport -- captured; Ctrl+Alt+G to release"
-                                           : "interp_mips Newport -- click to capture keyboard+mouse");
+  SDL_SetWindowTitle((SDL_Window *)win, on ? "indysim Newport -- captured; Ctrl+Alt+G to release"
+                                           : "indysim Newport -- click to capture keyboard+mouse");
 }
 
 void newport_sdl::abs_mouse_step() {
@@ -261,7 +261,7 @@ void newport_sdl::pump() {
 #else
 
 newport_sdl::newport_sdl(sgi_newport *np, state_t *s) : np(np), s(s) {
-  fprintf(stderr, "[newport] sdl: interp_mips was built without SDL2 (use NEWPORT_PPM=<file> instead)\n");
+  fprintf(stderr, "[newport] sdl: indysim was built without SDL2 (use NEWPORT_PPM=<file> instead)\n");
 }
 
 newport_sdl::~newport_sdl() {

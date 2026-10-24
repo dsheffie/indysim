@@ -352,7 +352,7 @@ int main(int argc, char *argv[]) {
 #endif
   
   if(lean) {
-    while(true ) {
+    while(not(s->brk)) {
       maybe_take_interrupt(s);   /* CP0 Count/Compare timer + Int delivery (per step) */
       execMips(s);
     }
