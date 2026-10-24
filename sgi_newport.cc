@@ -2246,7 +2246,7 @@ void sgi_newport::render(uint32_t *dst) {
             default: out = 0; break;
             }
         }
-        else if(pix_mode == 1) {               /* RGB map 0 (BGR in the framebuffer) */
+        else {                                 /* RGB maps 0/1/2 (BGR in the framebuffer) */
           uint32_t rgb = 0;
           switch(pix_size)
             {
@@ -2256,9 +2256,15 @@ void sgi_newport::render(uint32_t *dst) {
             default: rgb = c & 0xffffff; break;
             }
           out = ((rgb & 0xff) << 16) | (rgb & 0xff00) | ((rgb >> 16) & 0xff);
-        }
-        else {
-          out = (pix_mode == 2) ? 0xff00ff : 0x00ff00;   /* RGB maps 1/2: unsupported, as MAME */
+          /* XMAP9 spec 4.2: an RGB pixel goes through the CMAP one component at a time --
+           * red indexes the red byte of map entry ci_msb + R (0x1d00/0x1e00/0x1f00 for
+           * maps 0/1/2), green and blue likewise.  Maps 1/2 are the guest's gamma tables
+           * (MAME painted them solid green/magenta); map 0 stays direct for now. */
+          if(pix_mode != 1) {
+            out = (pal[ci_msb | ((out >> 16) & 0xff)] & 0xff0000) |
+                  (pal[ci_msb | ((out >> 8) & 0xff)] & 0x00ff00) |
+                  (pal[ci_msb | (out & 0xff)] & 0x0000ff);
+          }
         }
       }
       d[x] = lut_r[(out >> 16) & 0xff] | lut_g[(out >> 8) & 0xff] | lut_b[out & 0xff];
