@@ -344,7 +344,17 @@ int main(int argc, char *argv[]) {
   double t0 = timestamp();
   bbv_log *bbv = bbv_interval ? new bbv_log(bbv_interval) : nullptr;
   brtrace_log *brt = brtrace_out.empty() ? nullptr : new brtrace_log(brtrace_out.c_str());
-  while(s->brk == 0 && s->icnt < s->maxicnt) {
+
+  static const bool lean = true;
+  
+  if(lean) {
+    while(true ) {
+      maybe_take_interrupt(s);   /* CP0 Count/Compare timer + Int delivery (per step) */
+      execMips(s);
+    }
+  }
+
+  while(not(s->brk == 0) and not(s->icnt < s->maxicnt) and not(lean)) {
     /* BECOUNT: tally userspace + be-region (0x0c-0x10M text/libc) dynamic instrs; print at the crash pc. */
     { static const bool g_bec = getenv("BECOUNT") != nullptr;
       static uint64_t g_us=0, g_be=0; static uint64_t g_be_first_icnt=0;
