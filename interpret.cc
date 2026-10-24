@@ -6350,44 +6350,58 @@ static dinst_fn_t decode_insn(uint32_t inst) {
   return exec_itype<EL>;
 }
 
+/* the cold halves of the execMips front end, kept out of line so the hot path (fetch-
+ * cache hit, slot load, dispatch) needs few registers and a small prologue */
+static __attribute__((noinline)) bool fetch_refill(state_t *s, uint32_t *ipa_out) {
+  const uint32_t ipa = va_translate(s, (uint64_t)s->pc, tlb_op::fetch);
+  if(s->tlb_fault) {
+    return false;
+  }
+  /* UITLBSTATS models every fetch, so it keeps the cache off */
+  g_fc_valid = (g_uitlb_interval == 0);
+  g_fc_vpage = (uint64_t)s->pc >> 12;
+  g_fc_asid = s->cpr0_64[CPR0_ENTRYHI] & 0xffULL;
+  g_fc_sr = s->cpr0[CPR0_SR];
+  g_fc_ppage = ipa & ~0xfffu;
+  g_fc_dpage = dpage_for(ipa);
+  /* RAM and PROM pages are plain memory: fetch straight from the host page.  The MC/
+   * HPC register windows (0x1f000000..0x1fbfffff) and the memory hooks keep mem.get. */
+  const bool via_get = g_mem_hooks || ((ipa >> 24) == 0x1f && ipa < 0x1fc00000u);
+  g_fc_host = via_get ? nullptr : s->mem.peek_raw_ptr(ipa & ~0xfffu);
+  *ipa_out = ipa;
+  return true;
+}
+
+template <bool EL>
+static __attribute__((noinline)) void fill_slot(state_t *s, dinst_t *di, uint32_t ipa) {
+  di->inst = bswap<EL>(g_fc_host ? *reinterpret_cast<uint32_t *>(g_fc_host + (ipa & 0xfffu))
+                                 : s->mem.get<uint32_t>(ipa));
+  di->fn = decode_insn<EL>(di->inst);
+  g_code_page[dpage_key(ipa)] = 1;
+}
+
 template <bool EL, bool DBG>
 void execMips(state_t *s) {
   sparse_mem &mem = s->mem;
   s->gpr[0] = 0;   /* MIPS $0 is hardwired to zero; e.g. `mflo $0` must not stick */
   s->tlb_fault = false;
   uint32_t ipa;
-  const uint64_t f_vpage = (uint64_t)s->pc >> 12;
-  const uint64_t f_asid = s->cpr0_64[CPR0_ENTRYHI] & 0xffULL;
-  if(g_fc_valid && f_vpage == g_fc_vpage && f_asid == g_fc_asid && s->cpr0[CPR0_SR] == g_fc_sr) {
+  if(__builtin_expect(g_fc_valid && ((uint64_t)s->pc >> 12) == g_fc_vpage &&
+            (s->cpr0_64[CPR0_ENTRYHI] & 0xffULL) == g_fc_asid && s->cpr0[CPR0_SR] == g_fc_sr, 1)) {
     ipa = g_fc_ppage | (uint32_t)(s->pc & 0xfffULL);
 #ifdef ENABLE_CACHE_MODEL
     s->mem.cache_active = false;   /* as va_translate does: fetches are uncached in cache_model */
 #endif
   }
-  else {
-    ipa = va_translate(s, (uint64_t)s->pc, tlb_op::fetch);
-    if(s->tlb_fault) return;   /* instruction-fetch TLB miss -> vectored */
-    /* UITLBSTATS models every fetch, so it keeps the cache off */
-    g_fc_valid = (g_uitlb_interval == 0);
-    g_fc_vpage = f_vpage;
-    g_fc_asid = f_asid;
-    g_fc_sr = s->cpr0[CPR0_SR];
-    g_fc_ppage = ipa & ~0xfffu;
-    g_fc_dpage = dpage_for(ipa);
-    /* RAM and PROM pages are plain memory: fetch straight from the host page.  The MC/
-     * HPC register windows (0x1f000000..0x1fbfffff) and the memory hooks keep mem.get. */
-    const bool via_get = g_mem_hooks || ((ipa >> 24) == 0x1f && ipa < 0x1fc00000u);
-    g_fc_host = via_get ? nullptr : s->mem.peek_raw_ptr(ipa & ~0xfffu);
+  else if(!fetch_refill(s, &ipa)) {
+    return;                        /* instruction-fetch TLB miss -> vectored */
   }
   /* decoded-instruction cache (Bedichek, "decode once, execute many"): slots are
    * cleared when their physical page is written (code_page_written), so a filled
    * slot is current and the raw word is only read to fill an empty one */
   dinst_t *di = &g_fc_dpage[(ipa >> 2) & (DPAGE_SLOTS - 1)];
-  if(di->fn == nullptr) {
-    di->inst = bswap<EL>(g_fc_host ? *reinterpret_cast<uint32_t *>(g_fc_host + (ipa & 0xfffu))
-                                   : mem.get<uint32_t>(ipa));
-    di->fn = decode_insn<EL>(di->inst);
-    g_code_page[dpage_key(ipa)] = 1;
+  if(unlikely(di->fn == nullptr)) {
+    fill_slot<EL>(s, di, ipa);
   }
   const uint32_t inst = di->inst;
   if constexpr(DBG) { static const bool g_dis = getenv("DISPROBE") != nullptr;
