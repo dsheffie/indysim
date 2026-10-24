@@ -30,7 +30,7 @@ endif
 
 DEP = $(OBJ:.o=.d)
 OPT = -O3 -g -fomit-frame-pointer -std=c++17
-EXE = interp_mips
+EXE = indysim
 
 # Berkeley SoftFloat-3 (git submodule ./softfloat) -- bit-exact IEEE-754 with an
 # explicit rounding mode.  The interp calls it via extern "C".  Built by the
