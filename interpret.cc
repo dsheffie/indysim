@@ -19,6 +19,7 @@
 
 #include "interpret.hh"
 #include "sgi_hpc.hh"
+#include "sgi_mc.hh"
 #include "sgi_newport.hh"
 #include "sgi_scc.hh"
 #include "sclog.hh"
@@ -1459,6 +1460,25 @@ static inline bool ip22_gio_bus_error(uint32_t pa) {
   return false;
 }
 
+/* PROM memory sizing (ip24prom 0xbfc01070/0xbfc01640): the PROM makes ONE bank valid at
+ * base 0x20000000 (MEMCFG field base 0x80, 4 MB units) and probes it uncached -- walking
+ * ones (a mismatch = no SIMMs), then aliasing for the size.  Model the henry board: banks
+ * 0/1 populated (2 x 128 MB = the 256 MB at 0x08000000..0x17ffffff), banks 2/3 empty.  In
+ * the probe window bank 0/1 reach their memory (offset mod 128 MB, so the alias test sizes
+ * them at 128 MB); anything else is empty -- loads read 0, stores vanish (two scratch pages
+ * that never meet).  Without this every bank probed present and IRIX was told 512 MB, which
+ * a real Indy never had and henry does not back.  Mirrors henry_soc.sv w_hi_win. */
+static uint32_t ip22_probe_window(state_t *s, uint32_t pa, tlb_op op) {
+  const uint32_t cfg0 = s->mc->memcfg0_cpu();   /* bank0 [31:16], bank1 [15:0] */
+  if(((cfg0 >> 29) & 1) && ((cfg0 >> 16) & 0xff) == 0x80) {
+    return 0x08000000u | (pa & 0x07ffffffu);
+  }
+  if(((cfg0 >> 13) & 1) && (cfg0 & 0xff) == 0x80) {
+    return 0x10000000u | (pa & 0x07ffffffu);
+  }
+  return (op == tlb_op::store ? 0x2ffff000u : 0x2fffe000u) | (pa & 0xfffu);
+}
+
 static uint32_t va_translate(state_t *s, uint64_t va, tlb_op op) {
 #ifdef ENABLE_CACHE_MODEL
   if(g_wsprof && op == tlb_op::store) {                 /* WS profiler markers */
@@ -1470,6 +1490,9 @@ static uint32_t va_translate(state_t *s, uint64_t va, tlb_op op) {
   }
 #endif
   uint32_t pa = va_translate_inner(s, va, op);
+  if((pa >> 28) == 2 && s->mc) {
+    pa = ip22_probe_window(s, pa, op);
+  }
   static const bool g_nvlog = getenv("NVLOG") != nullptr;
   if(g_nvlog and op == tlb_op::load
      and (((uint32_t)s->pc >= 0x8800ab20u and (uint32_t)s->pc <= 0x8800b0b8u)
