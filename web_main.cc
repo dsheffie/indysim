@@ -194,6 +194,7 @@ int main(int argc, char *argv[]) {
   }
   g_sm->st = s;
   g_sm->route_devices = true;        /* IP22: low-memory alias + device window */
+  sparse_mem_update_hooks();
 
   initState(s);
   if(!filename.empty()) { load_elf(filename.c_str(), s); }   /* sets s->pc = entry */
