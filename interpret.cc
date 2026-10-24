@@ -380,10 +380,12 @@ static void console_watch(state_t *s, char c) {
   }
 }
 
+static uint64_t g_fpe_traps = 0;   /* FP exceptions taken (cause 15), shown with PCSAMPLE */
 void maybe_take_interrupt(state_t *s) {
   { static const unsigned long g_pcs = getenv("PCSAMPLE") ? strtoul(getenv("PCSAMPLE"),0,0) : 0;
     if(g_pcs && (s->icnt % g_pcs) == 0)
-      fprintf(stderr, "[pcsample] icnt=%llu pc=%08x\n", (unsigned long long)s->icnt, (uint32_t)s->pc); }
+      fprintf(stderr, "[pcsample] icnt=%llu pc=%08x fpe=%llu\n", (unsigned long long)s->icnt, (uint32_t)s->pc,
+              (unsigned long long)g_fpe_traps); }
   /* SASH_WATCH: one-shot dump of the environment the PROM hands sash -- the first
    * fetch in sash's link region (0x10000000..), with Status/sp/ARCS args + the TLB. */
   { static const bool g_sashw = getenv("SASH_WATCH") != nullptr;
@@ -600,6 +602,7 @@ static void take_exception_cpu(state_t *s, uint32_t ce) {
  * add/sub/mul on a denormal operand/underflow, matching the RTL fpu.sv.  The OS
  * soft-float emulator decodes insn@EPC and emulates it. */
 static void take_exception_fpe(state_t *s) {
+  g_fpe_traps++;
   set_exc_pc(s);
   bool exl_was_set = (s->cpr0[CPR0_SR] & SR_EXL) != 0;
   s->cpr0[CPR0_CAUSE] = (s->cpr0[CPR0_CAUSE] & ~(0x1fu << 2)) | (15u << 2);
@@ -1241,7 +1244,9 @@ static uint32_t va_translate_inner(state_t *s, uint64_t va, tlb_op op) {
 
   /* cache_model: default this access to uncached; the cached returns below set it.
    * Never cache an instruction fetch (D-cache-only model for now). */
+#ifdef ENABLE_CACHE_MODEL
   s->mem.cache_active = false;
+#endif
 
   /* 32-bit compatibility segments (sign-extended VA: hi32 is 0x00000000 for
    * useg or 0xffffffff for kseg0..kseg3). */
@@ -1249,7 +1254,9 @@ static uint32_t va_translate_inner(state_t *s, uint64_t va, tlb_op op) {
     uint32_t seg = lo32 >> 29;
     /* kseg0 (0x80000000-0x9fffffff) and kseg1 (0xa0000000-0xbfffffff): unmapped */
     if(seg == 0x4 || seg == 0x5) {
+#ifdef ENABLE_CACHE_MODEL
       if(seg == 0x4 && op != tlb_op::fetch) { s->mem.cache_active = true; } /* kseg0 cached */
+#endif
       return lo32 & 0x1fffffff;
     }
     /* useg/kuseg (seg 0-3), ksseg/kseg2 (seg 6), kseg3 (seg 7): TLB mapped */
@@ -1282,7 +1289,9 @@ static uint32_t va_translate_inner(state_t *s, uint64_t va, tlb_op op) {
   utlb_entry &ce = g_utlb[vpn & (UTLB_SZ - 1)];
   if(ce.valid && ce.vpn == vpn && ce.asid == cur_asid &&
      !(op == tlb_op::store && !ce.dirty)) {
+#ifdef ENABLE_CACHE_MODEL
     if(ce.cached && op != tlb_op::fetch) { s->mem.cache_active = true; }
+#endif
     return (ce.ppn << 12) | (uint32_t)(va & 0xfffULL);
   }
 
@@ -1372,7 +1381,9 @@ static uint32_t va_translate_inner(state_t *s, uint64_t va, tlb_op op) {
     /* fill the micro-TLB for this 4KB sub-page (only reached for a V=1 hit) */
     ce.vpn = vpn; ce.asid = cur_asid; ce.ppn = (uint32_t)(pa >> 12);
     ce.dirty = (e_lo & 0x4u) != 0; ce.valid = true; ce.cached = cca_cached;
+#ifdef ENABLE_CACHE_MODEL
     if(cca_cached && op != tlb_op::fetch) { s->mem.cache_active = true; }
+#endif
     return (uint32_t)pa;
   }
 
@@ -1449,6 +1460,7 @@ static inline bool ip22_gio_bus_error(uint32_t pa) {
 }
 
 static uint32_t va_translate(state_t *s, uint64_t va, tlb_op op) {
+#ifdef ENABLE_CACHE_MODEL
   if(g_wsprof && op == tlb_op::store) {                 /* WS profiler markers */
     uint32_t v32 = (uint32_t)va;
     if((v32 & 0xfffff000u) == 0x30000000u || (v32 & 0xfffff000u) == 0x30001000u)
@@ -1456,6 +1468,7 @@ static uint32_t va_translate(state_t *s, uint64_t va, tlb_op op) {
     if(v32 == 0x30000000u) { g_wsprof->reset(); fprintf(stderr,"### WSRESET\n"); }
     else if(v32 == 0x30001000u) { g_wsprof->dump("benchmark"); }
   }
+#endif
   uint32_t pa = va_translate_inner(s, va, op);
   static const bool g_nvlog = getenv("NVLOG") != nullptr;
   if(g_nvlog and op == tlb_op::load
@@ -1777,13 +1790,17 @@ void branch(uint32_t inst, state_t *s) {
     }
   }
   else {
-    bool ds_faulted = run_delay_slot<EL>(s);
     /* BLTZAL/BGEZAL: link UNCONDITIONALLY (not gated on takeBranch).  The PIC
      * bootstrap idiom `bltzal rX,.+8` with rX>=0 is the not-taken-but-must-link
-     * case -- gating the link on takeBranch left ra=0 -> wrong load bias. */
+     * case -- gating the link on takeBranch left ra=0 -> wrong load bias.
+     * Link BEFORE the delay slot, as jal/jalr do: the delay slot must see the new
+     * r31.  IRIX GL's `bal X; move v1,ra` (pmovedrawasm.s) took the stale ra, so
+     * __pstore_zb's `jr v1` jumped to itself forever (fsn hang).  A faulting delay
+     * slot re-executes the branch (EPC = branch, BD=1), rewriting the same link. */
     if(saveReturn) {
       s->gpr[31] = npc + 4;   /* full 64-bit link (n64 user PCs exceed 32 bits) */
     }
+    bool ds_faulted = run_delay_slot<EL>(s);
     if(takeBranch){
       if(!ds_faulted)
 	s->pc = (imm+npc);
@@ -3367,7 +3384,9 @@ void execMips(state_t *s) {
   const uint64_t f_asid = s->cpr0_64[CPR0_ENTRYHI] & 0xffULL;
   if(g_fc_valid && f_vpage == g_fc_vpage && f_asid == g_fc_asid && s->cpr0[CPR0_SR] == g_fc_sr) {
     ipa = g_fc_ppage | (uint32_t)(s->pc & 0xfffULL);
+#ifdef ENABLE_CACHE_MODEL
     s->mem.cache_active = false;   /* as va_translate does: fetches are uncached in cache_model */
+#endif
   }
   else {
     ipa = va_translate(s, (uint64_t)s->pc, tlb_op::fetch);

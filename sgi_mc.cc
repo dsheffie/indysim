@@ -147,10 +147,43 @@ uint32_t sgi_mc::read(uint32_t offs, size_t sz) {
  * again is always "ready" (1).  PRE (bit 0) selects the protect register; its
  * commands are accepted and ignored.  Bits: PRE 0x01, CS 0x02, SCK 0x04,
  * SDATAO (host->EEPROM) 0x08, SDATAI (EEPROM->host) 0x10. */
+static const char *g_nvram_file = getenv("EEPROM_FILE");   /* the 93CS56 (Indigo2 env; probed on Indy) */
+
+void sgi_mc::eeprom_load() {
+  if(g_nvram_file == nullptr) {
+    return;
+  }
+  FILE *f = fopen(g_nvram_file, "rb");
+  if(f == nullptr) {
+    fprintf(stderr, "[nvram] %s not found: starting erased\n", g_nvram_file);
+    return;
+  }
+  const size_t n = fread(ee_mem, sizeof(uint16_t), 128, f);
+  fclose(f);
+  fprintf(stderr, "[nvram] loaded %zu words from %s\n", n, g_nvram_file);
+}
+
+void sgi_mc::eeprom_save() {
+  if(g_nvram_file == nullptr) {
+    return;
+  }
+  FILE *f = fopen(g_nvram_file, "wb");
+  if(f == nullptr) {
+    return;
+  }
+  fwrite(ee_mem, sizeof(uint16_t), 128, f);
+  fclose(f);
+}
+
 void sgi_mc::eeprom_write(uint32_t ctrl) {
   const uint32_t prev = eeprom_ctrl;
   eeprom_ctrl = ctrl;
   const bool cs = (ctrl & 0x02) != 0;
+  static const bool g_ee_log = getenv("EEPROM_LOG") != nullptr;
+  if(g_ee_log && !cs && (prev & 0x02)) {
+    fprintf(stderr, "[eeprom] CS fall: op=%u addr=%02x nbits=%u sr=%05x wen=%d pre=%u icnt=%llu\n", ee_op, ee_addr,
+            ee_nbits, ee_sr, (int)ee_wen, prev & 0x01, (unsigned long long)s->icnt);
+  }
   if(!cs) {
     if((prev & 0x02) && !(prev & 0x01) && ee_wen && (ee_nbits >= 11)) {
       const uint32_t idx = ee_addr & 0x7f;
@@ -170,10 +203,12 @@ void sgi_mc::eeprom_write(uint32_t ctrl) {
 	  ee_mem[i] = 0xffff;
 	}
       }
+      eeprom_save();               /* a programming cycle ended: persist (NVRAM_FILE) */
     }
     ee_sr = 0;
     ee_nbits = 0;
     ee_nout = 0;
+    ee_reading = false;
     ee_di = true;                  /* ready */
     return;
   }
@@ -186,6 +221,13 @@ void sgi_mc::eeprom_write(uint32_t ctrl) {
   const bool rise = (ctrl & 0x04) && !(prev & 0x04);
   if(!rise) {
     return;
+  }
+  if((ee_nout == 0) && ee_reading) {
+    /* sequential read: keep clocking with CS high and the address auto-increments
+     * (the IP24 PROM reads the whole NVRAM in one CS cycle this way) */
+    ee_addr = (ee_addr + 1) & 0x7f;
+    ee_out = ee_mem[ee_addr];
+    ee_nout = 16;
   }
   if(ee_nout != 0) {
     --ee_nout;
@@ -205,6 +247,7 @@ void sgi_mc::eeprom_write(uint32_t ctrl) {
     if(ee_op == 2) {
       ee_out = ee_mem[ee_addr & 0x7f];
       ee_nout = 16;
+      ee_reading = true;
       ee_di = false;               /* the dummy 0 before the data */
     }
     else if(ee_op == 0) {

@@ -39,13 +39,21 @@ uint64_t g_watch_lo = 0, g_watch_hi = ~0ULL;
 uint64_t g_cur_pc = 0, g_cur_icnt = 0;
 uint64_t g_htrace = 0;
 
-/* Async control via signals (checked once per instruction in the run loop):
- *   SIGUSR1 -> dump the current IRIX process (comm/pid/pc)
- *   SIGUSR2 -> flush the SCSI COW overlay to its --disk-delta sidecar  */
+/* Async control via signals (handlers only set flags; the run loop tests g_sig_any
+ * once per instruction and does the work):
+ *   SIGUSR1   -> dump the current IRIX process (comm/pid/pc)
+ *   SIGUSR2   -> flush the SCSI COW overlay to its --disk-delta sidecar
+ *   SIGURG    -> start recording the retire trace (--retiretrace-signal)
+ *   SIGVTALRM -> stop it and write the window to <retiretrace>.<n> */
+static volatile sig_atomic_t g_sig_any        = 0;
 static volatile sig_atomic_t g_sig_dumpproc   = 0;
 static volatile sig_atomic_t g_sig_flushdelta = 0;
-static void on_sigusr1(int) { g_sig_dumpproc   = 1; }
-static void on_sigusr2(int) { g_sig_flushdelta = 1; }
+static volatile sig_atomic_t g_sig_trace_on   = 0;
+static volatile sig_atomic_t g_sig_trace_off  = 0;
+static void on_sigusr1(int) { g_sig_dumpproc   = 1; g_sig_any = 1; }
+static void on_sigusr2(int) { g_sig_flushdelta = 1; g_sig_any = 1; }
+static void on_sigurg(int)    { g_sig_trace_on  = 1; g_sig_any = 1; }
+static void on_sigvtalrm(int) { g_sig_trace_off = 1; g_sig_any = 1; }
 namespace globals {
   bool enClockFuncts = false;
   uint64_t icountMIPS = 0;
@@ -63,6 +71,7 @@ namespace globals {
 static state_t *s = nullptr;
 
 int main(int argc, char *argv[]) {
+  bool retiretrace_signal = false;
   std::string filename, arcs, retire_name, start_pc, disk, prom, disk_delta, ckpt_at, ckpt_out, restore_name;
   std::string cosim;   /* "server"|"client": lockstep co-sim vs the JIT sim */
   std::string cpu;
@@ -83,6 +92,7 @@ int main(int argc, char *argv[]) {
       ("file,f",    po::value<std::string>(&filename), "ELF kernel image")
       ("arcs",      po::value<std::string>(&arcs),     "ARCS firmware blob (loaded at PA 0x1000)")
       ("retiretrace", po::value<std::string>(&retire_name), "emit boost retire_trace for rv64analyzer")
+      ("retiretrace-signal", po::bool_switch(&retiretrace_signal), "with --retiretrace: start OFF; kill -URG <pid> starts recording, kill -VTALRM <pid> stops and writes <retiretrace>.<n>")
       ("maxicnt,m", po::value<uint64_t>(&maxinsns)->default_value(~(0UL)), "max instructions")
       ("start-pc", po::value<std::string>(&start_pc)->default_value(""), "fake-BIOS: start PC e.g. 0xa0003000 (skips pseudo_bios + arcs patch; firmware does the handoff)")
       ("disk",     po::value<std::string>(&disk),     "SCSI disk image for HD0 (raw, or read-only qcow2 -- e.g. irix65.img / irix65.qcow2)")
@@ -95,7 +105,7 @@ int main(int argc, char *argv[]) {
       ("bbv-out", po::value<std::string>(&bbv_out)->default_value("run.bbv"), "BBV output file (SimPoint .bb format)")
       ("brtrace", po::value<std::string>(&brtrace_out), "oracle branch trace for r9999 ORACLE_BP: one record per retired control transfer (predecode.sv classes)")
       ("virt", po::bool_switch(&virt), "r9999-virt device-free platform: flat RAM at PA 0 -- no IP22 memory alias, no device window")
-      ("newport", po::bool_switch(&newport), "SGI Newport (XL8; NEWPORT_XL24=1 for XL24) in the GIO graphics slot; NEWPORT_PPM=<file> dumps the display at exit")
+      ("newport", po::bool_switch(&newport), "SGI Newport (XL24; NEWPORT_XL8=1 for the 8-bit XL8) in the GIO graphics slot; NEWPORT_PPM=<file> dumps the display at exit")
       ("sdl", po::bool_switch(&sdl_out), "live SDL window for the Newport display (implies --newport)")
       ("checkpoint-every", po::value<uint64_t>(&ckpt_every)->default_value(0), "uniform sampling: dump a checkpoint every N instructions (to <checkpoint-out>.<icnt>) and keep running")
       ("checkpoint-start", po::value<uint64_t>(&ckpt_start)->default_value(0), "with --checkpoint-every: first dump at this icnt (default N)")
@@ -122,6 +132,7 @@ int main(int argc, char *argv[]) {
   /* CACHE_MODEL: model the R4x00/Indy write-back cache (32B lines) IRIX is built
    * for, so cache-coherence bugs the perfectly-coherent ISS hides become visible.
    * Off by default -> plain ISS behavior. */
+#ifdef ENABLE_CACHE_MODEL
   if(getenv("CACHE_MODEL")) {
     g_cmodel = new cache_model(*sm);
     g_stale_detect = getenv("STALE_DETECT") != nullptr;   /* flag stale cached reads */
@@ -132,6 +143,14 @@ int main(int argc, char *argv[]) {
     g_wsprof = new ws_profile();
     fprintf(stderr, "[ws_profile] ENABLED: data working-set curves (marker VA 0x30000000 reset / 0x30001000 dump)\n");
   }
+#else
+  /* the D-cache model and ws profiler cost a cache_active update on every translated
+   * access: compiled out unless built with -DENABLE_CACHE_MODEL */
+  if(getenv("CACHE_MODEL") || getenv("WSPROFILE")) {
+    fprintf(stderr, "CACHE_MODEL / WSPROFILE need a build with -DENABLE_CACHE_MODEL\n");
+    exit(1);
+  }
+#endif
   s = new state_t(*sm);
   s->maxicnt = maxinsns;
   s->mc  = new sgi_mc(s);
@@ -252,9 +271,10 @@ int main(int argc, char *argv[]) {
   }
 
   retire_trace rt;
+  int rt_windows = 0;
   if(!retire_name.empty()) {
     globals::retire_log = &rt;
-    globals::trace_retirement = true;
+    globals::trace_retirement = !retiretrace_signal;   /* signal mode: wait for SIGURG */
   }
 
   const char *pctrace = getenv("PCTRACE");
@@ -291,6 +311,12 @@ int main(int argc, char *argv[]) {
   
   signal(SIGUSR1, on_sigusr1);   /* kill -USR1 <pid> -> dump current IRIX process */
   signal(SIGUSR2, on_sigusr2);   /* kill -USR2 <pid> -> flush --disk-delta sidecar */
+  if(retiretrace_signal && !retire_name.empty()) {
+    signal(SIGURG, on_sigurg);       /* kill -URG <pid>    -> start the retire trace */
+    signal(SIGVTALRM, on_sigvtalrm); /* kill -VTALRM <pid> -> stop + write it */
+    fprintf(stderr, "[retiretrace] signal mode: kill -URG %d to start, kill -VTALRM %d to stop+write\n",
+            (int)getpid(), (int)getpid());
+  }
   if(gdb_port) s->gdb = new gdb_stub(gdb_port);
 #ifdef ENABLE_COSIM
   if(cosim == "server")      cosim_init(true);
@@ -313,6 +339,7 @@ int main(int argc, char *argv[]) {
     if((e = getenv("WATCH_LO")))  g_watch_lo   = strtoull(e, 0, 0);
     if((e = getenv("WATCH_HI")))  g_watch_hi   = strtoull(e, 0, 0);
   }
+  sparse_mem_update_hooks();   /* after every hook global above is set */
 
   double t0 = timestamp();
   bbv_log *bbv = bbv_interval ? new bbv_log(bbv_interval) : nullptr;
@@ -328,10 +355,34 @@ int main(int argc, char *argv[]) {
           fprintf(stderr,"[becount] crash pc=%08x sys_icnt=%lu | userspace=%lu | be_region(0c-10M)=%lu (first be icnt=%lu -> span=%lu)\n",
                   p,(unsigned long)s->icnt,(unsigned long)g_us,(unsigned long)g_be,
                   (unsigned long)g_be_first_icnt,(unsigned long)(s->icnt-g_be_first_icnt)); } }
-    if(g_sig_dumpproc)   { g_sig_dumpproc = 0;   dump_current_process(s);   tlbpm_report();
-      globals::asidpc_armed = !globals::asidpc_armed;
-      fprintf(stderr, "[asidpc] armed=%d icnt=%lu\n", globals::asidpc_armed, (unsigned long)s->icnt); }
-    if(g_sig_flushdelta) { g_sig_flushdelta = 0; if(s->scsi) s->scsi->flush_delta(); }
+    if(g_sig_any) {
+      g_sig_any = 0;
+      if(g_sig_dumpproc)   { g_sig_dumpproc = 0;   dump_current_process(s);   tlbpm_report();
+        globals::asidpc_armed = !globals::asidpc_armed;
+        fprintf(stderr, "[asidpc] armed=%d icnt=%lu\n", globals::asidpc_armed, (unsigned long)s->icnt); }
+      if(g_sig_flushdelta) { g_sig_flushdelta = 0; if(s->scsi) s->scsi->flush_delta(); }
+      if(g_sig_trace_on) {
+        g_sig_trace_on = 0;
+        if(globals::retire_log) {
+          globals::trace_retirement = true;
+          fprintf(stderr, "[retiretrace] START at icnt=%llu pc=%08x\n", (unsigned long long)s->icnt, (uint32_t)s->pc);
+        }
+      }
+      if(g_sig_trace_off) {
+        g_sig_trace_off = 0;
+        if(globals::retire_log && globals::trace_retirement) {
+          globals::trace_retirement = false;
+          const std::string out = retire_name + "." + std::to_string(rt_windows++);
+          std::ofstream ofs(out, std::ios::binary);
+          boost::archive::binary_oarchive oa(ofs);
+          oa << rt;
+          fprintf(stderr, "[retiretrace] STOP at icnt=%llu: wrote %zu records to %s\n",
+                  (unsigned long long)s->icnt, rt.get_records().size(), out.c_str());
+          rt.get_records().clear();
+          rt.tip.clear();
+        }
+      }
+    }
     if(pcsample && (s->icnt % pcsample) == 0)
       fprintf(stderr, "[pc] icnt=%lu pc=%08x ra=%08x sp=%08x\n",
               (unsigned long)s->icnt, (uint32_t)s->pc, (uint32_t)s->gpr[31], (uint32_t)s->gpr[29]);

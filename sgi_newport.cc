@@ -198,6 +198,7 @@ void sgi_newport::set_rb(const rb_snap_t &r) {
 }
 
 void sgi_newport::set_state(const uint8_t *rex_in, const rb_snap_t &r) {
+  disp_gen++;
   memcpy(&rex, rex_in, sizeof(rex));
   set_rb(r);
 }
@@ -447,7 +448,9 @@ uint8_t sgi_newport::vc2_t::cursor_pixel(int x, int y) {
 
 /* ---------------- board ---------------- */
 sgi_newport::sgi_newport(state_t *s) : s(s) {
-  static const bool g_xl24 = getenv("NEWPORT_XL24") != nullptr;
+  /* XL24 (24-bit) by default, as henry/the FPGA runs; NEWPORT_XL8=1 selects the 8-bit
+   * board, where GL dithers every shaded surface.  NEWPORT_XL24 is accepted (no-op). */
+  static const bool g_xl24 = getenv("NEWPORT_XL8") == nullptr;
   static const char *g_vb = getenv("NEWPORT_VBLANK_ICNT");
   vblank_period = g_vb ? strtoull(g_vb, nullptr, 0) : 1000000ull;
   if(vblank_period == 0) {
@@ -467,7 +470,10 @@ sgi_newport::sgi_newport(state_t *s) : s(s) {
   rb.global_mask = g_xl24 ? 0x00ffffffu : 0x000000ffu;
   for(int i = 0; i < 2; i++) {
     xmap[i].revision = g_xl24 ? 3 : 1;
-    cmap[i].revision = g_xl24 ? 0x02 : 0xa1;
+    /* CMAP revision: bits 7:4 are the monitor-ID sense, 0xa = the 1280x1024 monitor.
+     * XL24 used to report 0x02 (monitor 0), so the real IP24 PROM fell back to a
+     * 1024x768 setup that the fixed 1280x1024 framebuffer shows as a scrambled corner */
+    cmap[i].revision = g_xl24 ? 0xa2 : 0xa1;
     cmap[i].pal = new uint32_t[0x10000]();
   }
   vc2.ram = new uint16_t[VC2_RAM_SIZE]();
@@ -572,6 +578,7 @@ uint64_t sgi_newport::read(uint32_t offs, size_t sz) {
 }
 
 void sgi_newport::write(uint32_t offs, uint64_t v, size_t sz) {
+  disp_gen++;
   uint64_t g = 0;
   switch(sz)
     {
@@ -2143,10 +2150,13 @@ void sgi_newport::render(uint32_t *dst) {
     }
     const uint32_t *ci = &rb.rgbci[y * FB_W];
     const uint32_t *aux = &rb.cidaux[y * FB_W];
-    /* the DID line for this scanline, then its first entry */
-    vc2.did_frame_ptr = (uint16_t)(vc2.did_entry + y);
-    vc2.did_line_ptr = vc2.ram[vc2.did_frame_ptr & (VC2_RAM_SIZE - 1)];
-    uint16_t did = vc2.ram[vc2.did_line_ptr & (VC2_RAM_SIZE - 1)];
+    /* the DID line for this scanline, then its first entry.  Local pointers, NOT the
+     * VC2's guest-visible did_frame_ptr/did_line_ptr (MAME advances its own): render()
+     * runs for every SDL frame / PPM dump and must not change device state, or the
+     * guest's DID-table programming sees clobbered pointers (scrambled XL24 lines) */
+    const uint16_t did_frame_ptr = (uint16_t)(vc2.did_entry + y);
+    uint16_t did_line_ptr = vc2.ram[did_frame_ptr & (VC2_RAM_SIZE - 1)];
+    uint16_t did = vc2.ram[did_line_ptr & (VC2_RAM_SIZE - 1)];
     uint32_t te = 0, pix_mode = 0, pix_size = 0, aux_mode = 0, aux_msb = 0, ci_msb = 0;
     auto load_mode = [&]() {
       te = xmap[0].mode[did & 0x1f];
@@ -2161,8 +2171,8 @@ void sgi_newport::render(uint32_t *dst) {
         case 2: ci_msb = 0x1e00; break;
         default: ci_msb = 0x1f00; break;
         }
-      vc2.did_line_ptr++;
-      did = vc2.ram[vc2.did_line_ptr & (VC2_RAM_SIZE - 1)];
+      did_line_ptr++;
+      did = vc2.ram[did_line_ptr & (VC2_RAM_SIZE - 1)];
     };
     load_mode();
     for(uint32_t x = 0; x < DISP_W; x++) {

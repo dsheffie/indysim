@@ -19,6 +19,9 @@ class newport_sdl;
  * PPM (NEWPORT_PPM=<path>). */
 class sgi_newport {
 public:
+  uint64_t display_gen() const { return disp_gen; }   /* see disp_gen */
+  /* the guest's hardware cursor (VC2): image spans [cursor_x-31, cursor_x] */
+  void cursor_pos(int &x, int &y) const { x = vc2.cursor_x; y = vc2.cursor_y; }
   static const uint32_t BASE = 0x1f0f0000u;
   static const uint32_t SIZE = 0x2000u;
   static const uint32_t FB_W = 1280 + 64;     /* RB2 line pitch (pixels) */
@@ -142,6 +145,9 @@ private:
   uint64_t next_vblank = 0;
   uint64_t vblank_period = 0;
   uint64_t nframes = 0;
+  /* bumped on every guest/DMA write to the board (REX3, DCB: cmap/xmap/vc2 cursor)
+   * and on state restore: the display can only change when this moves */
+  uint64_t disp_gen = 0;
   uint32_t backbusy_reads = 0;   /* STATUS reads until an absent-slave DCB access clears BACKBUSY */
   bool in_dma = false;            /* accesses come from the MC graphics DMA engine */
   uint64_t go_pixels = 0;         /* pixels produced by the stepper (trace) */

@@ -90,7 +90,12 @@ public:
     return ioc2_local_mask[1] != 0 && (ioc2_local1_live() & ioc2_local_mask[1]) != 0;
   }
   void enet_poll();   /* drain the tap into the Seeq + deliver pending RX via DMA */
-  sgi_hpc(state_t *s) : s(s), intstat(0), misc(0) {}
+  sgi_hpc(state_t *s) : s(s), intstat(0), misc(0) { rtc_ram_load(); }
+  /* NVRAM_FILE=<path>: the ds1386 battery-backed RAM -- on an Indy (IP24) this holds
+   * the PROM environment (eaddr, monitor, console, ...) -- persists across runs:
+   * loaded at startup if the file exists, rewritten on every RAM write */
+  void rtc_ram_load();
+  void rtc_ram_save();
   uint32_t read_impl(uint32_t offs, size_t sz);
   uint32_t read(uint32_t offs, size_t sz);
   void write(uint32_t offs, uint32_t x, size_t sz);

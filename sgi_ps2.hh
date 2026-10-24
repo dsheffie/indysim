@@ -29,6 +29,8 @@ public:
   /* host input; name is a key name from the scan-code table ("a", "enter", ...) */
   bool key(const std::string &name, bool down);
   void mouse(int dx, int dy, uint8_t buttons);
+  /* no mouse motion waiting to reach (or be read by) the guest */
+  bool aux_idle() const { return host_aux.empty() && aux_q.empty(); }
   /* called once per vertical retrace: run the input script, move one queued event */
   void service(uint64_t icnt);
   uint8_t buttons() const { return mouse_buttons; }
@@ -62,6 +64,12 @@ private:
   uint64_t script_wait_until = 0;
   void load_script(const char *path);
   void run_script(uint64_t icnt);
+  /* NEWPORT_INPUT_FIFO=<path>: the same script commands, fed live through a named
+   * pipe (e.g. echo "type ls" > path) and appended to the script as they arrive */
+  int fifo_fd = -1, fifo_keepalive = -1;
+  std::string fifo_buf;
+  void add_script_line(const std::string &ln);
+  void poll_fifo();
   void type_text(const std::string &t);
 
   void refill();

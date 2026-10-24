@@ -29,6 +29,11 @@ class sgi_hpc;
  * address (store-watch on a PA) and to discover that PA (EA-print at a load PC). */
 extern uint32_t g_watch_pa;      /* store-watch PA (0 = off) */
 extern uint32_t g_watch_ldpc;    /* load-PC whose effective address to print (0 = off) */
+/* any per-access memory hook active (WSPROFILE ws profiler, cache model, WATCHPA /
+ * WATCHLDPC): get/set take the out-of-line *_hooked path only when set.  Recompute with
+ * sparse_mem_update_hooks() after changing any of them. */
+extern bool g_mem_hooks;
+void sparse_mem_update_hooks();
 extern uint64_t g_watch_lo, g_watch_hi;   /* icnt window [lo,hi) */
 extern uint64_t g_cur_pc, g_cur_icnt;     /* current insn context */
 extern uint64_t g_htrace;                 /* >0: trace next N executed pcs (kernel TLB-Mod handler) */
@@ -147,10 +152,26 @@ public:
       return (T)(~0ULL);
     }
 #endif
+    if(unlikely(g_mem_hooks)) {
+      return get_hooked<T>(byte_addr);
+    }
+    if(route_devices) {
+      if((byte_addr >> 24) == 0x1f) {
+        return route_load<T>(byte_addr);
+      }
+      byte_addr = mc_alias(byte_addr);
+    }
+    return *reinterpret_cast<T*>(backing(byte_addr));
+  }
+  /* the profiling/cache-model/watchpoint hooks, off the hot path (g_mem_hooks) */
+  template<typename T>
+  __attribute__((noinline)) T get_hooked(uint64_t byte_addr) {
+#ifdef ENABLE_CACHE_MODEL
     if(g_wsprof && cache_active) { g_wsprof->access((uint32_t)byte_addr); }
     if(g_cmodel && cache_active) {   /* cached cpu load -> the write-back model */
       T v; cm_load(g_cmodel, (uint32_t)byte_addr, &v, sizeof(T)); return v;
     }
+#endif
     if(unlikely(g_watch_ldpc && (uint32_t)g_cur_pc == g_watch_ldpc &&
                 g_cur_icnt >= g_watch_lo && g_cur_icnt < g_watch_hi)) {
       uint64_t _ea = byte_addr;
@@ -181,10 +202,27 @@ public:
       }
     }
 #endif
+    if(unlikely(g_mem_hooks)) {
+      set_hooked<T>(byte_addr, v);
+      return;
+    }
+    if(route_devices) {
+      if((byte_addr >> 24) == 0x1f) {
+        route_store<T>(byte_addr, v);
+        return;
+      }
+      byte_addr = mc_alias(byte_addr);
+    }
+    *reinterpret_cast<T*>(backing(byte_addr)) = v;
+  }
+  template<typename T>
+  __attribute__((noinline)) void set_hooked(uint64_t byte_addr, T v) {
+#ifdef ENABLE_CACHE_MODEL
     if(g_wsprof && cache_active) { g_wsprof->access((uint32_t)byte_addr); }
     if(g_cmodel && cache_active) {   /* cached cpu store -> the write-back model */
       cm_store(g_cmodel, (uint32_t)byte_addr, &v, sizeof(T)); return;
     }
+#endif
     if(unlikely(g_watch_pa && (uint32_t)byte_addr == g_watch_pa &&
                 g_cur_icnt >= g_watch_lo && g_cur_icnt < g_watch_hi))
       fprintf(stderr, "[wr] icnt=%lu pc=%08x pa=%08x val=%016llx sz=%zu\n",

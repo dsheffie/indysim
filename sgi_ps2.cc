@@ -1,4 +1,6 @@
 /* sgi_ps2.cc -- IP22 8042 PS/2 controller + AT keyboard + PS/2 mouse (see header). */
+#include <fcntl.h>
+#include <unistd.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -61,6 +63,19 @@ sgi_ps2::sgi_ps2(state_t *s) : s(s) {
   static const char *g_script = getenv("NEWPORT_INPUT");
   if(g_script) {
     load_script(g_script);
+  }
+  static const char *g_fifo = getenv("NEWPORT_INPUT_FIFO");
+  if(g_fifo) {
+    /* O_NONBLOCK so open() does not wait for a writer; our own (unused) writer keeps
+     * the pipe from reading as EOF between commands */
+    fifo_fd = ::open(g_fifo, O_RDONLY | O_NONBLOCK);
+    fifo_keepalive = ::open(g_fifo, O_WRONLY | O_NONBLOCK);
+    if(fifo_fd < 0) {
+      fprintf(stderr, "[ps2] cannot open input fifo %s (create it with mkfifo)\n", g_fifo);
+    }
+    else {
+      fprintf(stderr, "[ps2] live input fifo %s\n", g_fifo);
+    }
   }
 }
 
@@ -308,7 +323,35 @@ void sgi_ps2::mouse(int dx, int dy, uint8_t buttons) {
   } while(dx != 0 || dy != 0);
 }
 
+void sgi_ps2::add_script_line(const std::string &ln) {
+  if(ln.empty() || ln[0] == '#') {
+    return;
+  }
+  const size_t sp = ln.find(' ');
+  script_line_t l;
+  l.op = ln.substr(0, sp);
+  l.arg = (sp == std::string::npos) ? "" : ln.substr(sp + 1);
+  script.push_back(l);
+}
+
+void sgi_ps2::poll_fifo() {
+  char buf[4096];
+  const ssize_t n = ::read(fifo_fd, buf, sizeof(buf));
+  if(n <= 0) {
+    return;
+  }
+  fifo_buf.append(buf, (size_t)n);
+  size_t nl;
+  while((nl = fifo_buf.find('\n')) != std::string::npos) {
+    add_script_line(fifo_buf.substr(0, nl));
+    fifo_buf.erase(0, nl + 1);
+  }
+}
+
 void sgi_ps2::service(uint64_t icnt) {
+  if(fifo_fd >= 0) {
+    poll_fifo();
+  }
   run_script(icnt);
   /* hand over one event per device per retrace, and only into an empty queue,
    * so the guest's interrupt handler keeps up and its own replies are not mixed */
@@ -349,14 +392,7 @@ void sgi_ps2::load_script(const char *path) {
   }
   std::string ln;
   while(std::getline(in, ln)) {
-    if(ln.empty() || ln[0] == '#') {
-      continue;
-    }
-    const size_t sp = ln.find(' ');
-    script_line_t l;
-    l.op = ln.substr(0, sp);
-    l.arg = (sp == std::string::npos) ? "" : ln.substr(sp + 1);
-    script.push_back(l);
+    add_script_line(ln);
   }
   fprintf(stderr, "[ps2] input script %s: %zu commands\n", path, script.size());
 }

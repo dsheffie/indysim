@@ -639,9 +639,40 @@ uint8_t sgi_hpc::rtc_read(uint32_t reg) {
     }
 }
 
+static const char *g_nvram_file = getenv("NVRAM_FILE");
+
+void sgi_hpc::rtc_ram_load() {
+  if(g_nvram_file == nullptr) {
+    return;
+  }
+  FILE *f = fopen(g_nvram_file, "rb");
+  if(f == nullptr) {
+    fprintf(stderr, "[nvram] %s not found: ds1386 RAM starts zeroed\n", g_nvram_file);
+    return;
+  }
+  const size_t n = fread(rtc_ram, 1, sizeof(rtc_ram), f);
+  fclose(f);
+  fprintf(stderr, "[nvram] loaded %zu bytes of ds1386 RAM from %s\n", n, g_nvram_file);
+}
+
+void sgi_hpc::rtc_ram_save() {
+  if(g_nvram_file == nullptr) {
+    return;
+  }
+  FILE *f = fopen(g_nvram_file, "wb");
+  if(f == nullptr) {
+    return;
+  }
+  fwrite(rtc_ram, 1, sizeof(rtc_ram), f);
+  fclose(f);
+}
+
 void sgi_hpc::rtc_write(uint32_t reg, uint8_t v) {
   if(reg > 0xa || reg == 0x6) {
     rtc_ram[reg] = v;                            /* RAM; day-of-week follows the date */
+    if(reg > 0xa) {
+      rtc_ram_save();                            /* NVRAM_FILE persistence */
+    }
     return;
   }
   const time_t now = rtc_now(s) + (time_t)rtc_offset;

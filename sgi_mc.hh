@@ -27,8 +27,13 @@ class sgi_mc {
   uint32_t ee_nout = 0;
   uint32_t ee_op = 0, ee_addr = 0;
   bool ee_wen = false;            /* EWEN seen */
+  bool ee_reading = false;        /* a READ is streaming: more clocks = the next word */
   bool ee_di = true;              /* level on the DI (to-host) pin */
   void eeprom_write(uint32_t ctrl);
+  /* EEPROM_FILE=<path>: the 93CS56 persists across runs (Indigo2 keeps its PROM env here;
+   * an Indy only probes it -- see NVRAM_FILE in sgi_hpc for the Indy env) */
+  void eeprom_load();
+  void eeprom_save();
   uint32_t cpu_error_status;      /* reg 0xec (cstat) */
   uint32_t gio_error_status;      /* reg 0xfc (gstat) */
   uint32_t cpu_mem_access_config; /* reg 0xd4 (cmacc) */
@@ -80,6 +85,7 @@ public:
     for(int i = 0; i < 128; i++) {
       ee_mem[i] = 0xffff;          /* erased */
     }
+    eeprom_load();
     const char *e  = getenv("MEMCFG");
     const char *e1 = getenv("MEMCFG1");
     uint32_t cfg0 = e  ? (uint32_t)strtoul(e,  nullptr, 16) : 0x2320u;
