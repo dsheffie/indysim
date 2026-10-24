@@ -3306,50 +3306,36 @@ bool is_store_insn(state_t *s) {
 }
 
 
-template <bool EL, bool DBG>
-void execMips(state_t *s) {
+/* ---- decoded-instruction cache ----------------------------------------------------
+ * One lazily allocated page of slots per 4 KB physical page that has executed code,
+ * {handler, raw word}.  The fetch path still loads the raw word and re-decodes on a
+ * mismatch, so self-modifying code, DMA into code pages and PROM shadowing need no
+ * invalidation. */
+typedef void (*dinst_fn_t)(uint32_t inst, state_t *s);
+struct dinst_t {
+  dinst_fn_t fn;
+  uint32_t inst;
+};
+static const uint32_t DPAGE_SLOTS = 1024;
+static dinst_t *g_dpages[1u << 20];   /* by 4 KB physical page number (32-bit PA) */
+static dinst_t *g_fc_dpage = nullptr; /* decoded page for the fetch cache's page */
+static uint8_t *g_fc_host = nullptr;   /* host bytes of that page, or null: fetch via mem.get */
+
+static dinst_t *dpage_for(uint32_t pa) {
+  dinst_t *&d = g_dpages[pa >> 12];
+  if(d == nullptr) {
+    d = new dinst_t[DPAGE_SLOTS]();
+  }
+  return d;
+}
+
+/* Everything after fetch: the dynamic checks (64-bit gating, MIPS IV RI, CU1) and the
+ * full dispatch.  The decoded-instruction cache's default handler (see decode_insn).
+ */
+template <bool EL>
+static void exec_generic(uint32_t inst, state_t *s) {
   sparse_mem &mem = s->mem;
-  s->gpr[0] = 0;   /* MIPS $0 is hardwired to zero; e.g. `mflo $0` must not stick */
-  s->tlb_fault = false;
-  uint32_t ipa;
-  const uint64_t f_vpage = (uint64_t)s->pc >> 12;
-  const uint64_t f_asid = s->cpr0_64[CPR0_ENTRYHI] & 0xffULL;
-  if(g_fc_valid && f_vpage == g_fc_vpage && f_asid == g_fc_asid && s->cpr0[CPR0_SR] == g_fc_sr) {
-    ipa = g_fc_ppage | (uint32_t)(s->pc & 0xfffULL);
-#ifdef ENABLE_CACHE_MODEL
-    s->mem.cache_active = false;   /* as va_translate does: fetches are uncached in cache_model */
-#endif
-  }
-  else {
-    ipa = va_translate(s, (uint64_t)s->pc, tlb_op::fetch);
-    if(s->tlb_fault) return;   /* instruction-fetch TLB miss -> vectored */
-    /* UITLBSTATS models every fetch, so it keeps the cache off */
-    g_fc_valid = (g_uitlb_interval == 0);
-    g_fc_vpage = f_vpage;
-    g_fc_asid = f_asid;
-    g_fc_sr = s->cpr0[CPR0_SR];
-    g_fc_ppage = ipa & ~0xfffu;
-  }
-  uint32_t inst = bswap<EL>(mem.get<uint32_t>(ipa));
-  if constexpr(DBG) { static const bool g_dis = getenv("DISPROBE") != nullptr;
-    static uint32_t seen[128]; static int nseen=0;
-    uint32_t pc32=(uint32_t)s->pc;
-    bool inrange = (pc32>=0x0e636948u && pc32<0x0e6369c0u) || (pc32>=0x0e635d00u && pc32<0x0e635d60u);
-    if(g_dis && inrange) {
-      bool dup=false; for(int k=0;k<nseen;k++) if(seen[k]==pc32){dup=true;break;}
-      if(!dup && nseen<128){ seen[nseen++]=pc32;
-        fprintf(stderr,"[dis] %08x  %08x\n", pc32, inst); }
-    }
-  }
-  if(globals::trace_retirement and false) {
-    std::cout << std::hex
-	      << "cosim "
-	      << s->pc << ","
-	      << std::dec << " : "
-	      << getAsmString(inst, s->pc) << "\n";
-  }
-  //std::cout << std::hex << s->pc << std::dec << " : "
-  //<< getAsmString(inst, s->pc) << "\n";
+  (void)mem;
   uint32_t opcode = inst>>26;
   bool isRType = (opcode==0);
   bool isJType = ((opcode>>1)==1);
@@ -3366,296 +3352,6 @@ void execMips(state_t *s) {
   uint32_t rs = (inst >> 21) & 31;
   uint32_t rt = (inst >> 16) & 31;
   uint32_t rd = (inst >> 11) & 31;
-  s->icnt++;
-  /* RETLOG: scoped (icnt in [RETLO,RETHI]) retire log mirroring the silicon flight recorder
-   * (pc + first-changed-GPR + value), emitted for the PREVIOUS instruction (its result is now
-   * visible in s->gpr).  Used to align golden vs the silicon window and find the first divergence. */
-  if constexpr(DBG) { static const uint64_t rlo = getenv("RETLO") ? strtoull(getenv("RETLO"),0,0) : 0;
-    static const uint64_t rhi = getenv("RETHI") ? strtoull(getenv("RETHI"),0,0) : 0;
-    static int64_t pg[32]; static uint32_t ppc=0; static uint64_t picnt=0; static bool ph=false;
-    if(rlo && s->icnt>=rlo && s->icnt<=rhi) {
-      if(ph) {
-        int wr=-1; for(int k=1;k<32;k++) if(s->gpr[k]!=pg[k]) { wr=k; break; }
-        if(wr>=0) fprintf(stderr,"[ret] icnt=%llu pc=%08x r%d=%016llx\n",
-                          (unsigned long long)picnt, ppc, wr, (unsigned long long)s->gpr[wr]);
-        else      fprintf(stderr,"[ret] icnt=%llu pc=%08x (nowr)\n",(unsigned long long)picnt, ppc);
-      }
-      memcpy(pg, s->gpr, sizeof(pg)); ppc=(uint32_t)s->pc; picnt=s->icnt; ph=true;
-    } else ph=false;
-  }
-  /* NANWATCH=<count>: find where a NaN is BORN in the FP register file.
-   * Follows the RETLOG idiom -- the FP file is snapshotted before the current
-   * instruction runs and compared at the top of the NEXT call, so the culprit
-   * is always the PREVIOUS instruction (whose result is now visible).
-   *
-   * We watch ALL 32 registers rather than just an FP arith destination on
-   * purpose: the ISS traps every div/sqrt to the IRIX emulator, so a bad
-   * emulated result re-enters the FP file through a context RESTORE (ldc1 /
-   * dmtc1 in kernel mode), not through an arithmetic op.  An arith-only
-   * detector would miss exactly the case we most suspect.
-   *
-   * A register that was ALREADY NaN is ignored -- propagation is not birth.
-   * Format comes from cpr1_state[]; `unknown` is read as double (the FP codes
-   * under test -- turb3d/apsi/hydro2d -- are double precision).
-   * NANWATCH_MINICNT skips the boot so daemons//etc/init noise is suppressed. */
-  if constexpr(DBG) { /* periodic FP-trap census: the process may be killed rather than exit
-     * cleanly, and on a long soak we want the trend, not just a final total. */
-    static const uint64_t g_ftc = getenv("FPTRAPCOUNT") ? strtoull(getenv("FPTRAPCOUNT"),0,0) : 0;
-    if(g_ftc > 1 && (s->icnt % g_ftc) == 0) {
-      uint64_t tot = 0;
-      for(int i = 0; i < 8; i++) {
-        tot += g_fptrap[i];
-      }
-      fprintf(stderr, "[fptrap] icnt=%llu total=%llu", (unsigned long long)s->icnt,
-              (unsigned long long)tot);
-      for(int i = 0; i < 8; i++) {
-        if(g_fptrap[i]) {
-          fprintf(stderr, " %s=%llu", g_fptrap_name[i], (unsigned long long)g_fptrap[i]);
-        }
-      }
-      fprintf(stderr, "\n");
-    }
-  }
-  if constexpr(DBG) { static const uint64_t g_nanwatch = getenv("NANWATCH") ? strtoull(getenv("NANWATCH"),0,0) : 0;
-    static const uint64_t g_nw_min = getenv("NANWATCH_MINICNT") ? strtoull(getenv("NANWATCH_MINICNT"),0,0) : 0;
-    if(g_nanwatch && s->icnt >= g_nw_min) {
-      static uint64_t pf[32]; static uint8_t pdbl_v[32];
-      static uint32_t ppc = 0, pinst = 0; static uint64_t picnt = 0;
-      static bool ph = false; static uint64_t nfired = 0, nconsumed = 0;
-      static nan_taint_t g_pend_taint; static int g_pend_reg = -1; static bool g_pend_dbl = false;
-      if(g_pend_reg >= 0) {
-        /* The previous instruction's result is now visible: keep the tag only if
-         * it actually produced a NaN, otherwise the value is clean. */
-        g_ftaint[g_pend_reg] = fp_is_nan(s->cpr1[g_pend_reg], g_pend_dbl) ? g_pend_taint : nan_taint_t();
-        g_pend_reg = -1;
-      }
-      if(ph && nfired < g_nanwatch) {
-        for(int k = 0; k < 32; k++) {
-          bool dbl = (s->cpr1_state[k] != fp_reg_state::sp);
-          if(!fp_is_nan(s->cpr1[k], dbl)) {
-            continue;
-          }
-          if(fp_is_nan(pf[k], pdbl_v[k] != 0)) {
-            continue;   /* already NaN before: propagation, not birth */
-          }
-          /* Classify the culprit.  IRIX's bcopy moves 8 bytes at a time with
-           * ldc1/sdc1, so a naive "this register became NaN" test trips
-           * constantly on USER-mode FP loads of pointer-ish stack data -- that
-           * is NaN-SHAPED DATA, not a NaN.  Keep only the two meaningful cases:
-           *   ARITH  -- a COP1 arithmetic op produced it (a real IEEE invalid)
-           *   KERNEL -- a kernel-mode FP write produced it, i.e. the FP emulator
-           *             or a context restore, which is the path a trapped
-           *             div.d/sqrt.d takes and our prime suspect.
-           * A user-mode FP load/move is dropped as data movement. */
-          uint32_t sr = s->cpr0[CPR0_SR];
-          bool kmode = ((sr & 0x6) != 0) || (((sr >> 3) & 3) == 0);   /* EXL|ERL set, or KSU==kernel */
-          uint32_t pfmt = (pinst >> 21) & 31;
-          uint32_t pfn  = pinst & 0x3f;
-          bool is_arith = ((pinst >> 26) == 0x11) && (pfmt == 16 || pfmt == 17) &&
-                          (pfn <= 7) && (pfn != 6);
-          if(!is_arith) {
-            continue;   /* non-arith writes are reported via the USE line's ORIGIN */
-          }
-          nfired++;
-          fprintf(stderr, "[nanwatch] #%llu %s NaN born in f%d: icnt=%llu pc=%08x inst=%08x %s\n",
-                  (unsigned long long)nfired, is_arith ? "ARITH" : "KERNEL", k,
-                  (unsigned long long)picnt, ppc, pinst,
-                  getAsmString(pinst, ppc).c_str());
-          fprintf(stderr, "[nanwatch]     f%d: %016llx -> %016llx (%s)\n", k,
-                  (unsigned long long)pf[k], (unsigned long long)s->cpr1[k], dbl ? "d" : "s");
-          /* For an arith culprit print its operands as they stood BEFORE it
-           * executed -- that is the "what generated the NaN" answer. */
-          if(is_arith) {
-            bool adbl = (pfmt == 17);
-            uint32_t fs = (pinst >> 11) & 31, ft = (pinst >> 16) & 31;
-            fprintf(stderr, "[nanwatch]     operands fs=f%u %016llx (%.17g)  ft=f%u %016llx (%.17g)\n",
-                    fs, (unsigned long long)pf[fs], fp_as_double(pf[fs], adbl),
-                    ft, (unsigned long long)pf[ft], fp_as_double(pf[ft], adbl));
-          }
-          fprintf(stderr, "[nanwatch]     sr=%08x cause=%08x epc=%08x fcsr=%08x kernel=%d\n",
-                  sr, s->cpr0[CPR0_CAUSE], s->cpr0[CPR0_EPC], s->fcr1[CP1_CR31], kmode ? 1 : 0);
-        }
-      }
-      /* Taint propagation + reporting, done BEFORE the instruction executes so
-       * the source values and the effective address are the architectural ones. */
-      uint32_t op6 = inst >> 26;
-      if(op6 == 0x11 || op6 == 0x31 || op6 == 0x35 || op6 == 0x39 || op6 == 0x3d) {
-        uint32_t cfmt = (inst >> 21) & 31;
-        uint32_t cfn  = inst & 0x3f;
-        uint32_t cfs  = (inst >> 11) & 31;
-        uint32_t cft  = (inst >> 16) & 31;
-        uint32_t cfd  = (inst >> 6)  & 31;
-        bool cdbl     = (cfmt == 17);
-        if(op6 == 0x11 && (cfmt == 16 || cfmt == 17)) {
-          bool two_src  = (cfn <= 3) || (cfn >= 0x30);
-          bool consumer = (cfn <= 7 && cfn != 6) || (cfn >= 0x20 && cfn <= 0x25) || (cfn >= 0x30);
-          if(consumer) {
-            /* Report the first arithmetic USE of a NaN, naming its ORIGIN. */
-            for(int w = 0; w < (two_src ? 2 : 1); w++) {
-              uint32_t rg = (w == 0) ? cfs : cft;
-              if(!fp_is_nan(s->cpr1[rg], cdbl) || nconsumed >= g_nanwatch) {
-                continue;
-              }
-              nconsumed++;
-              const nan_taint_t &t = g_ftaint[rg];
-              fprintf(stderr, "[nanwatch] USE#%llu f%u=%016llx read by icnt=%llu pc=%08x inst=%08x\n",
-                      (unsigned long long)nconsumed, rg, (unsigned long long)s->cpr1[rg],
-                      (unsigned long long)s->icnt, (uint32_t)s->pc, inst);
-              fprintf(stderr, "[nanwatch]     ORIGIN %s icnt=%llu pc=%08x inst=%08x va=%016llx\n",
-                      nan_kind_name(t.kind), (unsigned long long)t.icnt, t.pc, t.inst,
-                      (unsigned long long)t.addr);
-              fprintf(stderr, "[nanwatch]     sr=%08x cause=%08x epc=%08x fcsr=%08x\n",
-                      s->cpr0[CPR0_SR], s->cpr0[CPR0_CAUSE], s->cpr0[CPR0_EPC], s->fcr1[CP1_CR31]);
-              break;
-            }
-            /* Result taint: inherit from a NaN source (keep the ROOT), else a
-             * fresh ARITH birth if this op is about to manufacture one. */
-            nan_taint_t inh; inh.kind = 0;
-            for(int w = 0; w < (two_src ? 2 : 1); w++) {
-              uint32_t rg = (w == 0) ? cfs : cft;
-              if(fp_is_nan(s->cpr1[rg], cdbl) && g_ftaint[rg].kind != 0) {
-                inh = g_ftaint[rg]; break;
-              }
-            }
-            if(inh.kind == 0) {
-              inh.icnt = s->icnt; inh.pc = (uint32_t)s->pc; inh.inst = inst; inh.kind = 1;
-            }
-            if(cfn < 0x30) {   /* compares write a cc, not an FP register */
-              g_pend_taint = inh; g_pend_reg = (int)cfd; g_pend_dbl = cdbl;
-            }
-          }
-          else if(cfn == 6) {   /* mov.fmt: a pure copy, carry the tag */
-            g_pend_taint = g_ftaint[cfs]; g_pend_reg = (int)cfd; g_pend_dbl = cdbl;
-          }
-        }
-        else if(op6 == 0x11 && (cfmt == 4 || cfmt == 5)) {   /* mtc1 / dmtc1 */
-          nan_taint_t t; t.icnt = s->icnt; t.pc = (uint32_t)s->pc; t.inst = inst; t.kind = 2;
-          g_pend_taint = t; g_pend_reg = (int)cfs; g_pend_dbl = (cfmt == 5);
-        }
-        else if(op6 == 0x31 || op6 == 0x35) {   /* lwc1 / ldc1 -- inherit through memory */
-          uint64_t ea = (uint64_t)(s->gpr[(inst >> 21) & 31] + (int32_t)(int16_t)(inst & 0xffff));
-          nan_taint_t t; t.kind = 0;
-          if(!g_mtaint.empty()) {
-            auto it = g_mtaint.find(ea);
-            if(it != g_mtaint.end()) { t = it->second; }
-          }
-          if(t.kind == 0) {   /* no FP store we saw wrote this: EXTERN if it is a NaN */
-            t.icnt = s->icnt; t.pc = (uint32_t)s->pc; t.inst = inst; t.kind = 2; t.addr = ea;
-          }
-          g_pend_taint = t; g_pend_reg = (int)cft; g_pend_dbl = (op6 == 0x35);
-        }
-        else if(op6 == 0x39 || op6 == 0x3d) {   /* swc1 / sdc1 -- carry the tag into memory */
-          uint64_t ea = (uint64_t)(s->gpr[(inst >> 21) & 31] + (int32_t)(int16_t)(inst & 0xffff));
-          bool sdbl = (op6 == 0x3d);
-          if(fp_is_nan(s->cpr1[cft], sdbl)) {
-            g_mtaint[ea] = g_ftaint[cft];
-          }
-          else if(!g_mtaint.empty()) {
-            g_mtaint.erase(ea);
-          }
-        }
-      }
-      /* Only snapshot around instructions that can ARCHITECTURALLY write an FP
-       * register -- COP1/COP1X arith+moves and the FP loads.  Everything else
-       * cannot change cpr1[], so scanning after it is wasted work (this keeps
-       * the probe off the hot path of an otherwise integer instruction mix). */
-      uint32_t pop = inst >> 26;
-      ph = (pop == 0x11) || (pop == 0x13) || (pop == 0x31) || (pop == 0x35);
-      if(ph) {
-        for(int k = 0; k < 32; k++) {
-          pdbl_v[k] = (s->cpr1_state[k] != fp_reg_state::sp) ? 1 : 0;
-        }
-        memcpy(pf, s->cpr1, sizeof(pf));
-        ppc = (uint32_t)s->pc; pinst = inst; picnt = s->icnt;
-      }
-    }
-  }
-  if constexpr(DBG) { /* PCHASH: rolling FNV-1a over the retired-PC stream, checkpoint every 65536.
-     * Compared against henry_tb's identical hash to find the first RTL/ISS PC
-     * divergence (expected only once interrupts skew the streams). */
-    static const bool g_pchash = getenv("PCHASH") != nullptr;
-    if(g_pchash) {
-      static uint64_t h = 1469598103934665603ULL;
-      h = (h ^ (uint32_t)s->pc) * 1099511628211ULL;
-      if((s->icnt & 0xffff) == 0) {
-        fprintf(stderr, "[pchash] icnt=%llu hash=%016llx pc=%08x\n",
-                (unsigned long long)s->icnt, (unsigned long long)h, (uint32_t)s->pc);
-      }
-    }
-    static const char *pd = getenv("PCDUMP");   /* "lo:hi" -> raw "P <pc>" for structural diff */
-    static uint64_t pd_lo = 0, pd_hi = 0; static bool pd_init = false;
-    if(!pd_init) { pd_init = true; if(pd) sscanf(pd, "%lu:%lu", &pd_lo, &pd_hi); }
-    if(pd && s->icnt >= pd_lo && s->icnt < pd_hi) {
-      fprintf(stderr, "P %08x\n", (uint32_t)s->pc);
-    }
-  }
-  if(DBG and globals::trace_retirement and globals::retire_log) {
-    /* optional TRACEWIN=lo:hi icnt window so a huge boot can emit a small,
-     * focused retire_trace (e.g. around a single XTLB refill) for mips-analyzer. */
-    static bool tw_init = false; static uint64_t tw_lo = 0, tw_hi = ~0ULL, tw_cap = 0, tw_ring = 0;
-    static bool tw_useronly = false, tw_kernonly = false, tw_trig_user = false, tw_armed = false;
-    static uint32_t tw_freeze_pc = 0;
-    static uint64_t tw_freeze_n = 1, tw_freeze_hits = 0;
-    static uint32_t tw_pc_lo = 0, tw_pc_hi = 0;
-    if(!tw_init) { tw_init = true; const char *tw = getenv("TRACEWIN");
-                   if(tw) sscanf(tw, "%lu:%lu", &tw_lo, &tw_hi);
-                   tw_useronly = getenv("TRACEWIN_USERONLY") != nullptr;
-                   tw_kernonly = getenv("TRACEWIN_KERNELONLY") != nullptr;   // pc >= 0x80000000 only: a
-                                                                             // ring of the net STACK, not
-                                                                             // the user loop between packets
-                   { const char *fp = getenv("TRACEWIN_FREEZE_PC");
-                     if(fp) tw_freeze_pc = strtoul(fp, nullptr, 0);
-                     const char *fn = getenv("TRACEWIN_FREEZE_N");
-                     if(fn) tw_freeze_n = strtoull(fn, nullptr, 0);
-                     const char *pl = getenv("TRACEWIN_PC_LO"), *ph = getenv("TRACEWIN_PC_HI");
-                     if(pl) tw_pc_lo = strtoul(pl, nullptr, 0);
-                     if(ph) tw_pc_hi = strtoul(ph, nullptr, 0); }
-                   tw_trig_user = getenv("TRACEWIN_TRIG_USER") != nullptr;      // arm on first o32 entry
-                   if(getenv("TRACEWIN_N")) tw_cap = strtoull(getenv("TRACEWIN_N"),0,0);
-                   if(getenv("TRACEWIN_RING")) tw_ring = strtoull(getenv("TRACEWIN_RING"),0,0);  // keep LAST N
-                   if(tw || tw_ring) fprintf(stderr, "[tracewin] lo=%llu hi=%llu useronly=%d cap=%llu ring=%llu\n",
-                                  (unsigned long long)tw_lo, (unsigned long long)tw_hi, tw_useronly,
-                                  (unsigned long long)tw_cap, (unsigned long long)tw_ring); }
-    if(tw_trig_user && !tw_armed && (uint32_t)s->pc < 0x80000000u) tw_armed = true;
-    if(!g_ring_frozen && s->icnt >= tw_lo && s->icnt < tw_hi && (!tw_trig_user || tw_armed)
-       && (tw_ring != 0 || tw_cap == 0 || globals::retire_log->get_records().size() < tw_cap)
-       && !(tw_useronly && (uint32_t)s->pc >= 0x80000000u)
-       && !(tw_kernonly && (uint32_t)s->pc <  0x80000000u)
-       && !(tw_pc_hi && ((uint32_t)s->pc < tw_pc_lo || (uint32_t)s->pc >= tw_pc_hi))) {
-      auto &recs = globals::retire_log->get_records();
-      recs.emplace_back(ipa, (uint64_t)s->pc, inst);
-      /* TRACEWIN_RING=N: keep only the last N records (trace the run-up to a crash,
-       * regardless of exact icnt). std::list pop_front is O(1). */
-      if(tw_ring != 0 && recs.size() > tw_ring) recs.pop_front();
-      if(tw_freeze_pc && (uint32_t)s->pc == tw_freeze_pc && tw_ring != 0 && recs.size() >= tw_ring
-         && (++tw_freeze_hits >= tw_freeze_n)) {
-        g_ring_frozen = true;
-        /* Force a CLEAN exit ~1 insn later so main() serializes the trace (a kill -9
-         * would discard it -- the boost archive is written only at normal exit). The
-         * ring is already frozen, so the trailing insns don't pollute it. */
-        s->maxicnt = s->icnt + 1;
-        fprintf(stderr, "[tracewin] froze ring at pc=%08x icnt=%llu (exiting to flush)\n",
-                tw_freeze_pc, (unsigned long long)s->icnt);
-      }
-    }
-  }
-  /* ASIDPC=<file>: per USERSPACE retire, dump (asid<<32 | vpc) as an 8-byte LE record.
-   * Offline: find be's ASID (the asid seen at vpc==0e788bc0), filter to it -> a be-only
-   * PC golden that aligns to the ASID-filtered silicon deep trace to locate the fork. */
-  if constexpr(DBG) { static FILE* g_asidpc = [](){ const char* p = getenv("ASIDPC"); return p ? fopen(p, "wb") : (FILE*)nullptr; }();
-    if(g_asidpc && globals::asidpc_armed && (uint32_t)s->pc < 0x80000000u) {
-      uint64_t rec = ((uint64_t)(s->cpr0_64[CPR0_ENTRYHI] & 0xffULL) << 32) | (uint32_t)s->pc;
-      fwrite(&rec, 8, 1, g_asidpc);
-    } }
-  if(DBG and globals::pctrace) {
-    static const bool useronly = getenv("PCTRACE_USERONLY") != nullptr;  /* only pc<0x80000000 */
-    if(!globals::pctrace_on && (uint32_t)s->pc == globals::pctrace_start) globals::pctrace_on = true;
-    if(globals::pctrace_on && !(useronly && (uint32_t)s->pc >= 0x80000000u))
-      fprintf(globals::pctrace, "%08x\n", (uint32_t)s->pc);
-  }
- 
-  
-  
   /* 64-bit ops raise Reserved Instruction when not in 64-bit mode (matches the
    * RTL decode_mips.sv gate; the random instruction tests rely on this). */
   if(is_64b_gated(inst) && !in_64b_mode(s)) {
@@ -4645,4 +4341,1120 @@ void execMips(state_t *s) {
 	break;
       }
   }
+}
+
+/* SPECIAL (R-type) ops (verbatim from exec_generic; the decoder routes only words that need none of
+ * its pre-dispatch checks here) */
+template <bool EL>
+static void exec_rtype(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem;
+  (void)mem;
+  uint32_t opcode = inst>>26;
+  uint32_t rs = (inst >> 21) & 31;
+  uint32_t rt = (inst >> 16) & 31;
+  uint32_t rd = (inst >> 11) & 31;
+  (void)opcode; (void)rs; (void)rt; (void)rd;
+    uint32_t funct = inst & 63;
+    uint32_t sa = (inst >> 6) & 31;
+    switch(funct) 
+      {
+      case 0x00: /*sll*/
+	s->gpr[rd] = static_cast<int32_t>(s->gpr[rt]) << sa;
+	s->pc += 4;
+	if(inst == 0) {
+	  HISTO(s, mipsInsn::NOP);
+	}
+	else {
+	  HISTO(s, mipsInsn::SLL);
+	}
+	break;
+      case 0x01: /* movci */
+	_movci(inst,s);
+	break;
+      case 0x02: /* srl */
+	s->gpr[rd] = sext64(((uint32_t)s->gpr[rt] >> sa));
+	s->pc += 4;
+	HISTO(s, mipsInsn::SRL);
+	break;
+      case 0x03: /* sra */
+	s->gpr[rd] = static_cast<int32_t>(s->gpr[rt]) >> sa;
+	s->pc += 4;
+	HISTO(s, mipsInsn::SRA);
+	break;	
+      case 0x04: /* sllv */
+	s->gpr[rd] = sext64(static_cast<uint32_t>(s->gpr[rt]) << (s->gpr[rs] & 0x1f));
+	s->pc += 4;
+	HISTO(s, mipsInsn::SLLV);
+	break;
+      case 0x06:  /* srlv: sign-extend the 32-bit logical-shift result (MIPS64) */
+	s->gpr[rd] = sext64((uint32_t)s->gpr[rt] >> (s->gpr[rs] & 0x1f));
+	s->pc += 4;
+	HISTO(s, mipsInsn::SRLV);
+	break;
+      case 0x07:  /* srav: 32-bit arithmetic shift, result sign-extended (MIPS64) */
+	s->gpr[rd] = static_cast<int32_t>(s->gpr[rt]) >> (s->gpr[rs] & 0x1f);
+	s->pc += 4;
+	HISTO(s, mipsInsn::SRAV);
+	break;
+      case 0x08: { /* jr */
+	state_t::reg_t jaddr = s->gpr[rs];
+	s->pc += 4;
+	if(!run_delay_slot<EL>(s))
+	  s->pc = jaddr;
+	HISTO(s, mipsInsn::JR);
+	break;
+      }
+      case 0x09: { /* jalr */
+	state_t::reg_t jaddr = s->gpr[rs];
+	if(rd != 0) {
+	  s->gpr[rd] = s->pc + 8;   /* full 64-bit link (n64 user PCs exceed 32 bits) */
+	}
+	s->pc += 4;
+	if(!run_delay_slot<EL>(s))
+	  s->pc = jaddr;
+	HISTO(s, mipsInsn::JALR);
+	break;
+      }
+      case 0x0C: /* syscall -> trap to kernel (ExcCode 8) */
+	raise_syscall(s);
+	HISTO(s, mipsInsn::BREAK);
+	break;
+      case 0x0D: /* break -> trap to kernel (ExcCode 9) */
+	raise_break(s);
+	HISTO(s, mipsInsn::BREAK);
+	break;
+      case 0x0f: /* sync */
+	s->pc += 4;
+	HISTO(s, mipsInsn::SYNC);
+	break;
+      case 0x10: /* mfhi */
+	s->gpr[rd] = s->hi;
+	s->pc += 4;
+	HISTO(s, mipsInsn::MFHI);
+	break;
+      case 0x11: /* mthi */ 
+	s->hi = s->gpr[rs];
+	s->pc += 4;
+	HISTO(s, mipsInsn::MTHI);
+	break;
+      case 0x12: /* mflo */
+	s->gpr[rd] = s->lo;
+	s->pc += 4;
+	HISTO(s, mipsInsn::MFLO);	
+	break;
+      case 0x13: /* mtlo */
+	s->lo = s->gpr[rs];
+	s->pc += 4;
+	HISTO(s, mipsInsn::MTLO);		
+	break;
+      case 0x18: { /* mult: 32x32 signed (operands are the low 32 bits) */
+	int64_t y;
+	y = (int64_t)(int32_t)s->gpr[rs] * (int64_t)(int32_t)s->gpr[rt];
+	s->lo = (int32_t)(y & 0xffffffff);
+	s->hi = (int32_t)(y >> 32);
+	s->pc += 4;
+	HISTO(s, mipsInsn::MULT);			
+	break;
+      }
+      case 0x19: { /* multu */
+	uint64_t y;
+	uint64_t u0 = (uint64_t)(uint32_t)s->gpr[rs];
+	uint64_t u1 = (uint64_t)(uint32_t)s->gpr[rt];
+	y = u0*u1;
+	s->lo = sext64((uint32_t)y);
+	s->hi = sext64((uint32_t)(y>>32));
+	s->pc += 4;
+	HISTO(s, mipsInsn::MULTU);
+	break;
+      }
+      case 0x1A: /* div: 32-bit signed, sign-extended (int64 avoids INT_MIN/-1 UB) */
+	if((int32_t)s->gpr[rt] != 0) {
+	  int64_t a = (int32_t)s->gpr[rs], b = (int32_t)s->gpr[rt];
+	  s->lo = sext64((uint32_t)(int32_t)(a / b));
+	  s->hi = sext64((uint32_t)(int32_t)(a % b));
+	}
+	s->pc += 4;
+	HISTO(s, mipsInsn::DIV);
+	break;
+      case 0x1B: /* divu */
+	if(s->gpr[rt] != 0) {
+	  s->lo = sext64((uint32_t)s->gpr[rs] / (uint32_t)s->gpr[rt]);
+	  s->hi = sext64((uint32_t)s->gpr[rs] % (uint32_t)s->gpr[rt]);
+	}
+	s->pc += 4;
+	HISTO(s, mipsInsn::DIVU);
+	break;
+      case 0x1C: { /* dmult: signed 64x64 -> 128, hi:lo */
+	__int128 y = (__int128)s->gpr[rs] * (__int128)s->gpr[rt];
+	s->lo = (int64_t)(y & 0xffffffffffffffffULL);
+	s->hi = (int64_t)(y >> 64);
+	s->pc += 4;
+	HISTO(s, mipsInsn::DMULT);
+	break;
+      }
+      case 0x1D: { /* dmultu: unsigned 64x64 -> 128, hi:lo */
+	unsigned __int128 y = (unsigned __int128)(uint64_t)s->gpr[rs]
+	                    * (unsigned __int128)(uint64_t)s->gpr[rt];
+	s->lo = (int64_t)(y & 0xffffffffffffffffULL);
+	s->hi = (int64_t)(uint64_t)(y >> 64);
+	s->pc += 4;
+	HISTO(s, mipsInsn::DMULTU);
+	break;
+      }
+      case 0x1E: /* ddiv: signed 64-bit divide */
+	if(s->gpr[rt] != 0) {
+	  s->lo = s->gpr[rs] / s->gpr[rt];
+	  s->hi = s->gpr[rs] % s->gpr[rt];
+	}
+	s->pc += 4;
+	HISTO(s, mipsInsn::DDIV);
+	break;
+      case 0x1F: /* ddivu: unsigned 64-bit divide */
+	if(s->gpr[rt] != 0) {
+	  s->lo = (int64_t)((uint64_t)s->gpr[rs] / (uint64_t)s->gpr[rt]);
+	  s->hi = (int64_t)((uint64_t)s->gpr[rs] % (uint64_t)s->gpr[rt]);
+	}
+	s->pc += 4;
+	HISTO(s, mipsInsn::DDIVU);
+	break;
+      case 0x20: { /* add */
+	uint32_t u_rs = (uint32_t)s->gpr[rs];
+	uint32_t u_rt = (uint32_t)s->gpr[rt];
+	uint32_t result = u_rs + u_rt;
+	/* Overflow iff same-sign inputs produce different-sign result.
+	 * Matches RTL: w_add32_overflow = (result[31]!=rt[31]) & (rs[31]==rt[31]) */
+	if (((result >> 31) != (u_rt >> 31)) && ((u_rs >> 31) == (u_rt >> 31))) {
+	  raise_overflow(s);
+	  break;
+	}
+	s->gpr[rd] = sext64(result);
+	s->pc += 4;
+	HISTO(s, mipsInsn::ADD);
+	break;
+      }
+      case 0x21: { /* addu */
+	uint32_t u_rs = (uint32_t)s->gpr[rs];
+	uint32_t u_rt = (uint32_t)s->gpr[rt];
+	s->gpr[rd] = sext64(u_rs + u_rt);
+	s->pc += 4;
+	HISTO(s, mipsInsn::ADDU);
+	break;
+      }
+      case 0x22: { /* sub */
+	uint32_t u_rs = (uint32_t)s->gpr[rs];
+	uint32_t u_rt = (uint32_t)s->gpr[rt];
+	uint32_t result = u_rs - u_rt;
+	/* A-B overflows iff operands differ in sign AND result sign != rs (minuend).
+	 * Matches RTL: w_sub32_overflow = (result[31]!=rs[31]) & (rs[31]!=rt[31]) */
+	if (((result >> 31) != (u_rs >> 31)) && ((u_rs >> 31) != (u_rt >> 31))) {
+	  raise_overflow(s);
+	  break;
+	}
+	s->gpr[rd] = sext64(result);
+	s->pc += 4;
+	HISTO(s, mipsInsn::SUB);
+	break;
+      }
+      case 0x23:{ /*subu*/  
+	uint32_t u_rs = (uint32_t)s->gpr[rs];
+	uint32_t u_rt = (uint32_t)s->gpr[rt];
+	uint32_t y = u_rs - u_rt;
+	s->gpr[rd] = sext64(y);
+	s->pc += 4;
+	HISTO(s, mipsInsn::SUBU);
+	break;
+      }
+      case 0x24: /* and */
+	s->gpr[rd] = s->gpr[rs] & s->gpr[rt];
+	s->pc += 4;
+	HISTO(s, mipsInsn::AND);
+	break;
+      case 0x25: /* or */
+	if(rd != 0) {
+	  s->gpr[rd] = s->gpr[rs] | s->gpr[rt];
+	}
+	s->pc += 4;
+	HISTO(s, mipsInsn::OR);
+	break;
+      case 0x26: /* xor */
+	s->gpr[rd] = s->gpr[rs] ^ s->gpr[rt];
+	s->pc += 4;
+	HISTO(s, mipsInsn::XOR);	
+	break;
+      case 0x27: /* nor */
+	s->gpr[rd] = ~(s->gpr[rs] | s->gpr[rt]);
+	s->pc += 4;
+	HISTO(s, mipsInsn::NOR);
+	break;
+      case 0x2A: /* slt */
+	s->gpr[rd] = s->gpr[rs] < s->gpr[rt];
+	s->pc += 4;
+	HISTO(s, mipsInsn::SLT);	
+	break;
+      case 0x2B: { /* sltu */
+	s->gpr[rd] = ((uint64_t)s->gpr[rs] < (uint64_t)s->gpr[rt]);
+	s->pc += 4;
+	HISTO(s, mipsInsn::SLTU);
+	break;
+      }
+      case 0x0B: /* movn */
+	s->gpr[rd] = (s->gpr[rt] != 0) ? s->gpr[rs] : s->gpr[rd];
+	s->pc +=4;
+	HISTO(s, mipsInsn::MOVN);
+	break;
+      case 0x0A: /* movz */
+	s->gpr[rd] = (s->gpr[rt] == 0) ? s->gpr[rs] : s->gpr[rd];
+	s->pc += 4;
+	HISTO(s, mipsInsn::MOVZ);	
+	break;
+      case 0x30: /* tge  */
+	if((int64_t)s->gpr[rs] >= (int64_t)s->gpr[rt]) { raise_trap(s); return; }
+	s->pc += 4; HISTO(s, mipsInsn::TGE); break;
+      case 0x31: /* tgeu */
+	if((uint64_t)s->gpr[rs] >= (uint64_t)s->gpr[rt]) { raise_trap(s); return; }
+	s->pc += 4; HISTO(s, mipsInsn::TGEU); break;
+      case 0x32: /* tlt  */
+	if((int64_t)s->gpr[rs] < (int64_t)s->gpr[rt]) { raise_trap(s); return; }
+	s->pc += 4; HISTO(s, mipsInsn::TLT); break;
+      case 0x33: /* tltu */
+	if((uint64_t)s->gpr[rs] < (uint64_t)s->gpr[rt]) { raise_trap(s); return; }
+	s->pc += 4; HISTO(s, mipsInsn::TLTU); break;
+      case 0x34: /* teq */
+	if(s->gpr[rs] == s->gpr[rt]) {
+	  raise_trap(s);
+	  return;
+	}
+	s->pc += 4;
+	HISTO(s, mipsInsn::TEQ);
+	break;
+      case 0x36: /* tne */
+	if(s->gpr[rs] != s->gpr[rt]) {
+	  raise_trap(s);
+	  return;
+	}
+	s->pc += 4;
+	HISTO(s, mipsInsn::TNE);
+	break;
+      case 0x2C: { /* dadd */
+	uint64_t u_rs = (uint64_t)s->gpr[rs];
+	uint64_t u_rt = (uint64_t)s->gpr[rt];
+	uint64_t result = u_rs + u_rt;
+	/* Matches RTL: w_add64_overflow = (result[63]!=rt[63]) & (rs[63]==rt[63]) */
+	if (((result >> 63) != (u_rt >> 63)) && ((u_rs >> 63) == (u_rt >> 63))) {
+	  raise_overflow(s);
+	  break;
+	}
+	s->gpr[rd] = (int64_t)result;
+	s->pc += 4;
+	HISTO(s, mipsInsn::DADD);
+	break;
+      }
+      case 0x2D: /* daddu */
+	s->gpr[rd] = s->gpr[rs] + s->gpr[rt];
+	s->pc += 4;
+	HISTO(s, mipsInsn::DADDU);
+	break;
+      case 0x2E: { /* dsub */
+	uint64_t u_rs = (uint64_t)s->gpr[rs];
+	uint64_t u_rt = (uint64_t)s->gpr[rt];
+	uint64_t result = u_rs - u_rt;
+	/* A-B overflows iff operands differ in sign AND result sign != rs (minuend).
+	 * Matches RTL: w_sub64_overflow = (result[63]!=rs[63]) & (rs[63]!=rt[63]) */
+	if (((result >> 63) != (u_rs >> 63)) && ((u_rs >> 63) != (u_rt >> 63))) {
+	  raise_overflow(s);
+	  break;
+	}
+	s->gpr[rd] = (int64_t)result;
+	s->pc += 4;
+	HISTO(s, mipsInsn::DSUB);
+	break;
+      }
+      case 0x2F: /* dsubu */
+	s->gpr[rd] = s->gpr[rs] - s->gpr[rt];
+	s->pc += 4;
+	HISTO(s, mipsInsn::DSUBU);
+	break;
+      case 0x14: /* dsllv: rd = rt << rs[5:0] */
+	s->gpr[rd] = s->gpr[rt] << (s->gpr[rs] & 63);
+	s->pc += 4;
+	HISTO(s, mipsInsn::DSLLV);
+	break;
+      case 0x16: /* dsrlv: rd = rt >> rs[5:0] (logical) */
+	s->gpr[rd] = (int64_t)((uint64_t)s->gpr[rt] >> (s->gpr[rs] & 63));
+	s->pc += 4;
+	HISTO(s, mipsInsn::DSRLV);
+	break;
+      case 0x17: /* dsrav: rd = rt >> rs[5:0] (arithmetic) */
+	s->gpr[rd] = s->gpr[rt] >> (s->gpr[rs] & 63);
+	s->pc += 4;
+	HISTO(s, mipsInsn::DSRAV);
+	break;
+      case 0x38: /* dsll: rd = rt << sa */
+	s->gpr[rd] = s->gpr[rt] << sa;
+	s->pc += 4;
+	HISTO(s, mipsInsn::DSLL);
+	break;
+      case 0x3A: /* dsrl: rd = rt >> sa (logical) */
+	s->gpr[rd] = (int64_t)((uint64_t)s->gpr[rt] >> sa);
+	s->pc += 4;
+	HISTO(s, mipsInsn::DSRL);
+	break;
+      case 0x3B: /* dsra: rd = rt >> sa (arithmetic) */
+	s->gpr[rd] = s->gpr[rt] >> sa;
+	s->pc += 4;
+	HISTO(s, mipsInsn::DSRA);
+	break;
+      case 0x3C: /* dsll32: rd = rt << (sa + 32) */
+	s->gpr[rd] = s->gpr[rt] << (sa + 32);
+	s->pc += 4;
+	HISTO(s, mipsInsn::DSLL32);
+	break;
+      case 0x3E: /* dsrl32: rd = rt >> (sa + 32) (logical) */
+	s->gpr[rd] = (int64_t)((uint64_t)s->gpr[rt] >> (sa + 32));
+	s->pc += 4;
+	HISTO(s, mipsInsn::DSRL32);
+	break;
+      case 0x3F: /* dsra32: rd = rt >> (sa + 32) (arithmetic) */
+	s->gpr[rd] = s->gpr[rt] >> (sa + 32);
+	s->pc += 4;
+	HISTO(s, mipsInsn::DSRA32);
+	break;
+      default:
+	raise_ri(s, inst);
+	break;
+      }
+}
+
+/* J/JAL (verbatim from exec_generic; the decoder routes only words that need none of
+ * its pre-dispatch checks here) */
+template <bool EL>
+static void exec_jtype(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem;
+  (void)mem;
+  uint32_t opcode = inst>>26;
+  uint32_t rs = (inst >> 21) & 31;
+  uint32_t rt = (inst >> 16) & 31;
+  uint32_t rd = (inst >> 11) & 31;
+  (void)opcode; (void)rs; (void)rt; (void)rd;
+    state_t::reg_t jaddr = inst & ((1<<26)-1);
+    jaddr <<= 2;
+    if(opcode==0x2) { /* j */
+      s->pc += 4;
+      HISTO(s, mipsInsn::J);
+    }
+    else if(opcode==0x3) { /* jal */
+      s->gpr[31] = s->pc + 8;   /* full 64-bit link (n64 user PCs exceed 32 bits) */
+      s->pc += 4;
+      HISTO(s, mipsInsn::JAL);
+    }
+    else {
+      printf("Unknown JType instruction\n");
+      exit(-1);
+    }
+    jaddr |= (s->pc & (~static_cast<state_t::reg_t>((1<<28)-1)));
+    if(!run_delay_slot<EL>(s))
+      s->pc = jaddr;
+    //printf("new pc = %lx\n", jaddr);
+}
+
+/* I-type ops (verbatim from exec_generic; the decoder routes only words that need none of
+ * its pre-dispatch checks here) */
+template <bool EL>
+static void exec_itype(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem;
+  (void)mem;
+  uint32_t opcode = inst>>26;
+  uint32_t rs = (inst >> 21) & 31;
+  uint32_t rt = (inst >> 16) & 31;
+  uint32_t rd = (inst >> 11) & 31;
+  (void)opcode; (void)rs; (void)rt; (void)rd;
+    uint32_t uimm32 = inst & ((1<<16) - 1);
+    int16_t simm16 = (int16_t)uimm32;
+    int32_t simm32 = (int32_t)simm16;
+    int32_t tmp;
+    switch(opcode) 
+      {
+      case 0x01:
+	_bgez_bltz<EL>(inst, s); 
+	break;
+      case 0x04:
+	branch<EL,branch_type::beq>(inst, s);
+	break;
+      case 0x05:
+	branch<EL,branch_type::bne>(inst, s); 
+	break;
+      case 0x06:
+	branch<EL,branch_type::blez>(inst, s); 
+	break;
+      case 0x07:
+	branch<EL,branch_type::bgtz>(inst, s); 
+	break;
+      case 0x08: { /* addi: 32-bit add, traps on signed 32-bit overflow */
+	uint32_t u_rs  = (uint32_t)s->gpr[rs];
+	uint32_t u_imm = (uint32_t)simm32;
+	uint32_t result = u_rs + u_imm;
+	/* same rule as add (0x20): same-sign inputs, different-sign result */
+	if (((result >> 31) != (u_imm >> 31)) && ((u_rs >> 31) == (u_imm >> 31))) {
+	  raise_overflow(s);
+	  break;
+	}
+	s->gpr[rt] = sext64(result);
+	s->pc+=4;
+	HISTO(s, mipsInsn::ADDI);
+	break;
+      }
+      case 0x09: /* addiu: 32-bit add, result sign-extended (MIPS64) */
+	tmp = sext64((uint32_t)(s->gpr[rs] + simm32));
+	s->gpr[rt] = tmp;
+	s->pc+=4;
+	HISTO(s, mipsInsn::ADDIU);
+	break;
+      case 0x0A: /* slti */
+	s->gpr[rt] = (s->gpr[rs] < simm32);
+	s->pc += 4;
+	HISTO(s, mipsInsn::SLTI);
+	break;
+      case 0x0B:/* sltiu */
+	s->gpr[rt] = ((uint64_t)s->gpr[rs] < (uint64_t)(int64_t)simm32);
+	s->pc += 4;
+	HISTO(s, mipsInsn::SLTIU);
+	break;
+      case 0x0c: /* andi */
+	s->gpr[rt] = s->gpr[rs] & uimm32;
+	s->pc += 4;
+	HISTO(s, mipsInsn::ANDI);
+	break;
+      case 0x0d: /* ori */
+	s->gpr[rt] = s->gpr[rs] | uimm32;
+	s->pc += 4;
+	HISTO(s, mipsInsn::ORI);
+	break;
+      case 0x0e: /* xori */
+	s->gpr[rt] = s->gpr[rs] ^ uimm32;
+	s->pc += 4;
+	HISTO(s, mipsInsn::XORI);
+	break;
+      case 0x0F: /* lui */
+	uimm32 <<= 16;
+	s->gpr[rt] = sext64(uimm32);
+	s->pc += 4;
+	HISTO(s, mipsInsn::LUI);
+	break;
+      case 0x14:
+	branch<EL,branch_type::beql>(inst, s); 
+	break;
+      case 0x16:
+	branch<EL,branch_type::blezl>(inst, s); 
+	break;
+      case 0x15:
+	branch<EL,branch_type::bnel>(inst, s); 
+	break;
+      case 0x17:
+	branch<EL,branch_type::bgtzl>(inst, s);
+	break;
+      case 0x18: { /* daddi: doubleword add immediate, traps on signed 64-bit overflow */
+	uint64_t u_rs  = (uint64_t)s->gpr[rs];
+	uint64_t u_imm = (uint64_t)(int64_t)simm32;   /* sign-extend imm to 64 bits */
+	uint64_t result = u_rs + u_imm;
+	/* same overflow rule as dadd (0x2C): same-sign inputs, different-sign result */
+	if (((result >> 63) != (u_imm >> 63)) && ((u_rs >> 63) == (u_imm >> 63))) {
+	  raise_overflow(s);
+	  break;
+	}
+	s->gpr[rt] = (int64_t)result;
+	s->pc += 4;
+	HISTO(s, mipsInsn::DADDI);
+	break;
+      }
+      case 0x19: /* daddiu */
+	s->gpr[rt] = s->gpr[rs] + simm32;
+	s->pc += 4;
+	HISTO(s, mipsInsn::DADDIU);
+	break;
+      case 0x1a:
+	_ldl<EL>(inst, s);
+	break;
+      case 0x1b:
+	_ldr<EL>(inst, s);
+	break;
+      case 0x20:
+	_lb(inst, s);
+	break;
+      case 0x21:
+	_lh<EL>(inst, s);
+	break;
+      case 0x22: 
+	_lwl<EL>(inst, s);
+	break;
+      case 0x23:
+	_lw<EL>(inst, s);
+	break;
+      case 0x24:
+	_lbu(inst, s);
+	break;
+      case 0x27: { /* lwu: load word unsigned (zero-extend to 64 bits) */
+	uint32_t rs_ = (inst >> 21) & 31;
+	uint32_t rt_ = (inst >> 16) & 31;
+	int32_t imm  = (int32_t)(int16_t)(inst & 0xffffu);
+	uint32_t ea  = va_translate(s, s->gpr[rs_] + imm, tlb_op::load);
+	if(s->tlb_fault) break;
+	if(ea & 3) { raise_adel(s); break; }
+	s->gpr[rt_] = (uint64_t)(uint32_t)bswap<EL>(s->mem.get<int32_t>(ea));
+	s->pc += 4;
+	HISTO(s, mipsInsn::LWU);
+	break;
+      }
+      case 0x25:
+	_lhu<EL>(inst, s);
+	break;
+      case 0x26:
+	_lwr<EL>(inst, s);
+	break;
+      case 0x28:
+	_sb(inst, s); 
+	break;
+      case 0x29:
+	_sh<EL>(inst, s); 
+	break;
+      case 0x2a:
+	_swl<EL>(inst, s);
+	break;
+      case 0x2B:
+	_sw<EL>(inst, s);
+	break;
+      case 0x2c:
+	_sdl<EL>(inst, s);
+	break;
+      case 0x2d:
+	_sdr<EL>(inst, s);
+	break;
+      case 0x2e:
+	_swr<EL>(inst, s);
+	break;
+      case 0x2f: /* cache */
+	{
+	  uint32_t rs  = (inst >> 21) & 31;
+	  uint32_t cop = (inst >> 16) & 31;       /* [20:18]=op  [17:16]=cache(0=I,1=D,2=SI,3=SD) */
+	  int16_t  himm = (int16_t)(inst & 0xffff);
+	  uint64_t va  = s->gpr[rs] + (int32_t)himm;
+	  { static const bool g_watchinvl = getenv("WATCHINVL") != nullptr;
+	    if(g_watchinvl) {
+	      uint32_t wpa = 0; bool wm = tlb_probe_ro(s, va, &wpa);
+	      if(wm && ((wpa & ~0x1fu) == 0x0086d81c0u)) {
+		fprintf(stderr, "[invl] icnt=%llu pc=%08x cache=%u op=%u va=%016llx pa=%08x\n",
+			(unsigned long long)s->icnt, (uint32_t)s->pc,
+			(unsigned)(cop & 3), (unsigned)((cop >> 2) & 7),
+			(unsigned long long)va, wpa);
+	      }
+	    }
+	  }
+	  if(g_cache_dbg) {
+	    uint32_t dbgpa = 0; bool mapped = tlb_probe_ro(s, va, &dbgpa);
+	    fprintf(stderr, "[cache] icnt=%llu pc=%08x op=0x%02x va=%016llx pa=%08x set=%u\n",
+		    (unsigned long long)s->icnt, (uint32_t)s->pc, cop,
+		    (unsigned long long)va, mapped ? dbgpa : (uint32_t)(va & 0x1fffffff),
+		    cache_model::set_of(mapped ? dbgpa : (uint32_t)(va & 0x1fffffff)));
+	  }
+	  { /* SCSIZE: emulate the SD tag ops for size_2nd_cache (Index_Store_Tag_SD at
+	     * index 0, then Index_Load_Tag_SD at 128K, 256K, ... until it reads back the
+	     * zero it stored = the index wrapped).  Tags are keyed by the SC index. */
+	    static const uint32_t g_scsize = getenv("SCSIZE") ? (uint32_t)strtoul(getenv("SCSIZE"), 0, 0) : 0;
+	    static std::unordered_map<uint32_t, uint32_t> g_sctag;
+	    uint32_t which = cop & 0x3, op = (cop >> 2) & 0x7;
+	    if(g_scsize && which == 3 && (op == 1 || op == 2)) {
+	      uint32_t idx = (uint32_t)(va & 0x1fffffffu) % g_scsize;
+	      if(op == 2) {
+		g_sctag[idx] = (uint32_t)s->cpr0[28];              /* Index_Store_Tag_SD <- TagLo */
+	      }
+	      else {
+		auto it = g_sctag.find(idx);                        /* Index_Load_Tag_SD -> TagLo */
+		uint32_t t = (it != g_sctag.end()) ? it->second : (0x80000000u | (uint32_t)(va & 0x1fffffffu) >> 4);
+		s->cpr0[28] = t;
+		s->cpr0_64[28] = t;
+	      }
+	    }
+	    if(sclog_file() && (which == 1 || which == 3)) {
+	      /* hit ops name a physical line; index ops an index (log va & 0x1fffffff) */
+	      uint32_t lpa = (uint32_t)(va & 0x1fffffffu);
+	      if(op >= 4) {
+		uint32_t tpa = 0;
+		lpa = tlb_probe_ro(s, va, &tpa) ? tpa : 0xffffffffu;
+	      }
+	      sclog(1, s->icnt, lpa, 0, (uint32_t)s->pc, (uint8_t)cop);
+	    }
+	  }
+	  if(g_cmodel) {
+	    uint32_t which   = cop & 0x3;         /* 0=I 1=D 2=SI 3=SD */
+	    uint32_t cacheop = (cop >> 2) & 0x7;  /* 0=IdxWBInv 4=HitInv 5=HitWBInv 6=HitWB */
+	    uint32_t pa = 0;
+	    if(which == 1) {                      /* primary D-cache */
+	      switch(cacheop) {
+	      case 0: g_cmodel->index_wb_inval((uint32_t)va); break;      /* Index_WB_Invalidate */
+	      case 4: if(tlb_probe_ro(s, va, &pa)) g_cmodel->hit_inval(pa);    break; /* Hit_Invalidate */
+	      case 5: if(tlb_probe_ro(s, va, &pa)) g_cmodel->hit_wb_inval(pa); break; /* Hit_WB_Invalidate */
+	      case 6: if(tlb_probe_ro(s, va, &pa)) g_cmodel->hit_wb(pa);       break; /* Hit_WB */
+	      default: break;                     /* Index_Load/Store_Tag: no-op (model starts clean) */
+	      }
+	    }
+	    /* I-cache (which==0): D-only model + DRAM-direct fetch already captures code
+	     * coherence (a fetch reads DRAM, so the D-cache must be WB'd first).
+	     * SD/SI (which 2,3): no secondary cache -> no-op. */
+	  }
+	  s->pc += 4;
+	}
+	break;
+      case 0x31:
+	_lwc1<EL>(inst, s);
+	break;
+      case 0x33: /* prefetch */
+	s->pc += 4;
+	break;
+      case 0x35:
+	_ldc1<EL>(inst, s);
+	break;
+      case 0x39:
+	_swc1<EL>(inst, s);
+	break;
+      case 0x37:
+	_ld<EL>(inst, s);
+	break;
+      case 0x3D:
+	_sdc1<EL>(inst, s);
+	break;
+      case 0x3F:
+	_sd<EL>(inst, s);
+	break;
+      default:
+	raise_ri(s, inst);
+	break;
+      }
+}
+
+/* raw instruction word -> handler.  Every check exec_generic does before dispatch is a
+ * static property of the word except its mode/CU1 test, so words that need one keep
+ * going through exec_generic; the rest go straight to their class or op handler. */
+template <bool EL>
+static dinst_fn_t decode_insn(uint32_t inst) {
+  const uint32_t op = inst >> 26, fn = inst & 0x3fu;
+  if(is_64b_gated(inst)) {
+    return exec_generic<EL>;                       /* needs the 64-bit-mode check */
+  }
+  if(op == 0x11 || op == 0x13 || op == 0x31 || op == 0x35 || op == 0x39 || op == 0x3d) {
+    return exec_generic<EL>;                       /* CU1 check (and COP1X's MIPS IV RI) */
+  }
+  if(op == 0 && (fn == 0x01 || fn == 0x0a || fn == 0x0b)) {
+    return exec_generic<EL>;                       /* movci/movz/movn: MIPS IV RI */
+  }
+  if(op == 0) {
+    return exec_rtype<EL>;
+  }
+  if(op == 0x02 || op == 0x03) {
+    return exec_jtype<EL>;
+  }
+  if(op == 0x10 || op == 0x12 || op == 0x1c || op == 0x1f || op == 0x30 || op == 0x38 ||
+     op == 0x34 || op == 0x3c) {
+    return exec_generic<EL>;                       /* COP0/COP2/SPECIAL2/3, LL/SC/LLD/SCD */
+  }
+  switch(op)
+    {
+  case 0x01: return _bgez_bltz<EL>;
+  case 0x04: return branch<EL,branch_type::beq>;
+  case 0x05: return branch<EL,branch_type::bne>;
+  case 0x06: return branch<EL,branch_type::blez>;
+  case 0x07: return branch<EL,branch_type::bgtz>;
+  case 0x14: return branch<EL,branch_type::beql>;
+  case 0x15: return branch<EL,branch_type::bnel>;
+  case 0x16: return branch<EL,branch_type::blezl>;
+  case 0x17: return branch<EL,branch_type::bgtzl>;
+  case 0x1a: return _ldl<EL>;
+  case 0x1b: return _ldr<EL>;
+  case 0x20: return _lb;
+  case 0x21: return _lh<EL>;
+  case 0x22: return _lwl<EL>;
+  case 0x23: return _lw<EL>;
+  case 0x24: return _lbu;
+  case 0x25: return _lhu<EL>;
+  case 0x26: return _lwr<EL>;
+  case 0x28: return _sb;
+  case 0x29: return _sh<EL>;
+  case 0x2a: return _swl<EL>;
+  case 0x2b: return _sw<EL>;
+  case 0x2c: return _sdl<EL>;
+  case 0x2d: return _sdr<EL>;
+  case 0x2e: return _swr<EL>;
+  case 0x31: return _lwc1<EL>;
+  case 0x35: return _ldc1<EL>;
+  case 0x37: return _ld<EL>;
+  case 0x39: return _swc1<EL>;
+  case 0x3d: return _sdc1<EL>;
+  case 0x3f: return _sd<EL>;
+    default: break;
+    }
+  return exec_itype<EL>;
+}
+
+template <bool EL, bool DBG>
+void execMips(state_t *s) {
+  sparse_mem &mem = s->mem;
+  s->gpr[0] = 0;   /* MIPS $0 is hardwired to zero; e.g. `mflo $0` must not stick */
+  s->tlb_fault = false;
+  uint32_t ipa;
+  const uint64_t f_vpage = (uint64_t)s->pc >> 12;
+  const uint64_t f_asid = s->cpr0_64[CPR0_ENTRYHI] & 0xffULL;
+  if(g_fc_valid && f_vpage == g_fc_vpage && f_asid == g_fc_asid && s->cpr0[CPR0_SR] == g_fc_sr) {
+    ipa = g_fc_ppage | (uint32_t)(s->pc & 0xfffULL);
+#ifdef ENABLE_CACHE_MODEL
+    s->mem.cache_active = false;   /* as va_translate does: fetches are uncached in cache_model */
+#endif
+  }
+  else {
+    ipa = va_translate(s, (uint64_t)s->pc, tlb_op::fetch);
+    if(s->tlb_fault) return;   /* instruction-fetch TLB miss -> vectored */
+    /* UITLBSTATS models every fetch, so it keeps the cache off */
+    g_fc_valid = (g_uitlb_interval == 0);
+    g_fc_vpage = f_vpage;
+    g_fc_asid = f_asid;
+    g_fc_sr = s->cpr0[CPR0_SR];
+    g_fc_ppage = ipa & ~0xfffu;
+    g_fc_dpage = dpage_for(ipa);
+    /* RAM and PROM pages are plain memory: fetch straight from the host page.  The MC/
+     * HPC register windows (0x1f000000..0x1fbfffff) and the memory hooks keep mem.get. */
+    const bool via_get = g_mem_hooks || ((ipa >> 24) == 0x1f && ipa < 0x1fc00000u);
+    g_fc_host = via_get ? nullptr : s->mem.get_raw_ptr(ipa & ~0xfffu);
+  }
+  uint32_t inst = bswap<EL>(g_fc_host ? *reinterpret_cast<uint32_t *>(g_fc_host + (ipa & 0xfffu))
+                                      : mem.get<uint32_t>(ipa));
+  if constexpr(DBG) { static const bool g_dis = getenv("DISPROBE") != nullptr;
+    static uint32_t seen[128]; static int nseen=0;
+    uint32_t pc32=(uint32_t)s->pc;
+    bool inrange = (pc32>=0x0e636948u && pc32<0x0e6369c0u) || (pc32>=0x0e635d00u && pc32<0x0e635d60u);
+    if(g_dis && inrange) {
+      bool dup=false; for(int k=0;k<nseen;k++) if(seen[k]==pc32){dup=true;break;}
+      if(!dup && nseen<128){ seen[nseen++]=pc32;
+        fprintf(stderr,"[dis] %08x  %08x\n", pc32, inst); }
+    }
+  }
+  if(globals::trace_retirement and false) {
+    std::cout << std::hex
+	      << "cosim "
+	      << s->pc << ","
+	      << std::dec << " : "
+	      << getAsmString(inst, s->pc) << "\n";
+  }
+  //std::cout << std::hex << s->pc << std::dec << " : "
+  //<< getAsmString(inst, s->pc) << "\n";
+  uint32_t opcode = inst>>26;
+  bool isRType = (opcode==0);
+  bool isJType = ((opcode>>1)==1);
+  bool isCoproc0 = (opcode == 0x10);
+  bool isCoproc1 = (opcode == 0x11);
+  bool isCoproc1x = (opcode == 0x13);
+  bool isCoproc2 = (opcode == 0x12);
+  bool isSpecial2 = (opcode == 0x1c); 
+  bool isSpecial3 = (opcode == 0x1f);
+  bool isLoadLinked = (opcode == 0x30);
+  bool isStoreCond = (opcode == 0x38);
+  bool isLoadLinkedD = (opcode == 0x34);   /* lld */
+  bool isStoreCondD = (opcode == 0x3c);    /* scd */
+  uint32_t rs = (inst >> 21) & 31;
+  uint32_t rt = (inst >> 16) & 31;
+  uint32_t rd = (inst >> 11) & 31;
+  s->icnt++;
+  /* RETLOG: scoped (icnt in [RETLO,RETHI]) retire log mirroring the silicon flight recorder
+   * (pc + first-changed-GPR + value), emitted for the PREVIOUS instruction (its result is now
+   * visible in s->gpr).  Used to align golden vs the silicon window and find the first divergence. */
+  if constexpr(DBG) { static const uint64_t rlo = getenv("RETLO") ? strtoull(getenv("RETLO"),0,0) : 0;
+    static const uint64_t rhi = getenv("RETHI") ? strtoull(getenv("RETHI"),0,0) : 0;
+    static int64_t pg[32]; static uint32_t ppc=0; static uint64_t picnt=0; static bool ph=false;
+    if(rlo && s->icnt>=rlo && s->icnt<=rhi) {
+      if(ph) {
+        int wr=-1; for(int k=1;k<32;k++) if(s->gpr[k]!=pg[k]) { wr=k; break; }
+        if(wr>=0) fprintf(stderr,"[ret] icnt=%llu pc=%08x r%d=%016llx\n",
+                          (unsigned long long)picnt, ppc, wr, (unsigned long long)s->gpr[wr]);
+        else      fprintf(stderr,"[ret] icnt=%llu pc=%08x (nowr)\n",(unsigned long long)picnt, ppc);
+      }
+      memcpy(pg, s->gpr, sizeof(pg)); ppc=(uint32_t)s->pc; picnt=s->icnt; ph=true;
+    } else ph=false;
+  }
+  /* NANWATCH=<count>: find where a NaN is BORN in the FP register file.
+   * Follows the RETLOG idiom -- the FP file is snapshotted before the current
+   * instruction runs and compared at the top of the NEXT call, so the culprit
+   * is always the PREVIOUS instruction (whose result is now visible).
+   *
+   * We watch ALL 32 registers rather than just an FP arith destination on
+   * purpose: the ISS traps every div/sqrt to the IRIX emulator, so a bad
+   * emulated result re-enters the FP file through a context RESTORE (ldc1 /
+   * dmtc1 in kernel mode), not through an arithmetic op.  An arith-only
+   * detector would miss exactly the case we most suspect.
+   *
+   * A register that was ALREADY NaN is ignored -- propagation is not birth.
+   * Format comes from cpr1_state[]; `unknown` is read as double (the FP codes
+   * under test -- turb3d/apsi/hydro2d -- are double precision).
+   * NANWATCH_MINICNT skips the boot so daemons//etc/init noise is suppressed. */
+  if constexpr(DBG) { /* periodic FP-trap census: the process may be killed rather than exit
+     * cleanly, and on a long soak we want the trend, not just a final total. */
+    static const uint64_t g_ftc = getenv("FPTRAPCOUNT") ? strtoull(getenv("FPTRAPCOUNT"),0,0) : 0;
+    if(g_ftc > 1 && (s->icnt % g_ftc) == 0) {
+      uint64_t tot = 0;
+      for(int i = 0; i < 8; i++) {
+        tot += g_fptrap[i];
+      }
+      fprintf(stderr, "[fptrap] icnt=%llu total=%llu", (unsigned long long)s->icnt,
+              (unsigned long long)tot);
+      for(int i = 0; i < 8; i++) {
+        if(g_fptrap[i]) {
+          fprintf(stderr, " %s=%llu", g_fptrap_name[i], (unsigned long long)g_fptrap[i]);
+        }
+      }
+      fprintf(stderr, "\n");
+    }
+  }
+  if constexpr(DBG) { static const uint64_t g_nanwatch = getenv("NANWATCH") ? strtoull(getenv("NANWATCH"),0,0) : 0;
+    static const uint64_t g_nw_min = getenv("NANWATCH_MINICNT") ? strtoull(getenv("NANWATCH_MINICNT"),0,0) : 0;
+    if(g_nanwatch && s->icnt >= g_nw_min) {
+      static uint64_t pf[32]; static uint8_t pdbl_v[32];
+      static uint32_t ppc = 0, pinst = 0; static uint64_t picnt = 0;
+      static bool ph = false; static uint64_t nfired = 0, nconsumed = 0;
+      static nan_taint_t g_pend_taint; static int g_pend_reg = -1; static bool g_pend_dbl = false;
+      if(g_pend_reg >= 0) {
+        /* The previous instruction's result is now visible: keep the tag only if
+         * it actually produced a NaN, otherwise the value is clean. */
+        g_ftaint[g_pend_reg] = fp_is_nan(s->cpr1[g_pend_reg], g_pend_dbl) ? g_pend_taint : nan_taint_t();
+        g_pend_reg = -1;
+      }
+      if(ph && nfired < g_nanwatch) {
+        for(int k = 0; k < 32; k++) {
+          bool dbl = (s->cpr1_state[k] != fp_reg_state::sp);
+          if(!fp_is_nan(s->cpr1[k], dbl)) {
+            continue;
+          }
+          if(fp_is_nan(pf[k], pdbl_v[k] != 0)) {
+            continue;   /* already NaN before: propagation, not birth */
+          }
+          /* Classify the culprit.  IRIX's bcopy moves 8 bytes at a time with
+           * ldc1/sdc1, so a naive "this register became NaN" test trips
+           * constantly on USER-mode FP loads of pointer-ish stack data -- that
+           * is NaN-SHAPED DATA, not a NaN.  Keep only the two meaningful cases:
+           *   ARITH  -- a COP1 arithmetic op produced it (a real IEEE invalid)
+           *   KERNEL -- a kernel-mode FP write produced it, i.e. the FP emulator
+           *             or a context restore, which is the path a trapped
+           *             div.d/sqrt.d takes and our prime suspect.
+           * A user-mode FP load/move is dropped as data movement. */
+          uint32_t sr = s->cpr0[CPR0_SR];
+          bool kmode = ((sr & 0x6) != 0) || (((sr >> 3) & 3) == 0);   /* EXL|ERL set, or KSU==kernel */
+          uint32_t pfmt = (pinst >> 21) & 31;
+          uint32_t pfn  = pinst & 0x3f;
+          bool is_arith = ((pinst >> 26) == 0x11) && (pfmt == 16 || pfmt == 17) &&
+                          (pfn <= 7) && (pfn != 6);
+          if(!is_arith) {
+            continue;   /* non-arith writes are reported via the USE line's ORIGIN */
+          }
+          nfired++;
+          fprintf(stderr, "[nanwatch] #%llu %s NaN born in f%d: icnt=%llu pc=%08x inst=%08x %s\n",
+                  (unsigned long long)nfired, is_arith ? "ARITH" : "KERNEL", k,
+                  (unsigned long long)picnt, ppc, pinst,
+                  getAsmString(pinst, ppc).c_str());
+          fprintf(stderr, "[nanwatch]     f%d: %016llx -> %016llx (%s)\n", k,
+                  (unsigned long long)pf[k], (unsigned long long)s->cpr1[k], dbl ? "d" : "s");
+          /* For an arith culprit print its operands as they stood BEFORE it
+           * executed -- that is the "what generated the NaN" answer. */
+          if(is_arith) {
+            bool adbl = (pfmt == 17);
+            uint32_t fs = (pinst >> 11) & 31, ft = (pinst >> 16) & 31;
+            fprintf(stderr, "[nanwatch]     operands fs=f%u %016llx (%.17g)  ft=f%u %016llx (%.17g)\n",
+                    fs, (unsigned long long)pf[fs], fp_as_double(pf[fs], adbl),
+                    ft, (unsigned long long)pf[ft], fp_as_double(pf[ft], adbl));
+          }
+          fprintf(stderr, "[nanwatch]     sr=%08x cause=%08x epc=%08x fcsr=%08x kernel=%d\n",
+                  sr, s->cpr0[CPR0_CAUSE], s->cpr0[CPR0_EPC], s->fcr1[CP1_CR31], kmode ? 1 : 0);
+        }
+      }
+      /* Taint propagation + reporting, done BEFORE the instruction executes so
+       * the source values and the effective address are the architectural ones. */
+      uint32_t op6 = inst >> 26;
+      if(op6 == 0x11 || op6 == 0x31 || op6 == 0x35 || op6 == 0x39 || op6 == 0x3d) {
+        uint32_t cfmt = (inst >> 21) & 31;
+        uint32_t cfn  = inst & 0x3f;
+        uint32_t cfs  = (inst >> 11) & 31;
+        uint32_t cft  = (inst >> 16) & 31;
+        uint32_t cfd  = (inst >> 6)  & 31;
+        bool cdbl     = (cfmt == 17);
+        if(op6 == 0x11 && (cfmt == 16 || cfmt == 17)) {
+          bool two_src  = (cfn <= 3) || (cfn >= 0x30);
+          bool consumer = (cfn <= 7 && cfn != 6) || (cfn >= 0x20 && cfn <= 0x25) || (cfn >= 0x30);
+          if(consumer) {
+            /* Report the first arithmetic USE of a NaN, naming its ORIGIN. */
+            for(int w = 0; w < (two_src ? 2 : 1); w++) {
+              uint32_t rg = (w == 0) ? cfs : cft;
+              if(!fp_is_nan(s->cpr1[rg], cdbl) || nconsumed >= g_nanwatch) {
+                continue;
+              }
+              nconsumed++;
+              const nan_taint_t &t = g_ftaint[rg];
+              fprintf(stderr, "[nanwatch] USE#%llu f%u=%016llx read by icnt=%llu pc=%08x inst=%08x\n",
+                      (unsigned long long)nconsumed, rg, (unsigned long long)s->cpr1[rg],
+                      (unsigned long long)s->icnt, (uint32_t)s->pc, inst);
+              fprintf(stderr, "[nanwatch]     ORIGIN %s icnt=%llu pc=%08x inst=%08x va=%016llx\n",
+                      nan_kind_name(t.kind), (unsigned long long)t.icnt, t.pc, t.inst,
+                      (unsigned long long)t.addr);
+              fprintf(stderr, "[nanwatch]     sr=%08x cause=%08x epc=%08x fcsr=%08x\n",
+                      s->cpr0[CPR0_SR], s->cpr0[CPR0_CAUSE], s->cpr0[CPR0_EPC], s->fcr1[CP1_CR31]);
+              break;
+            }
+            /* Result taint: inherit from a NaN source (keep the ROOT), else a
+             * fresh ARITH birth if this op is about to manufacture one. */
+            nan_taint_t inh; inh.kind = 0;
+            for(int w = 0; w < (two_src ? 2 : 1); w++) {
+              uint32_t rg = (w == 0) ? cfs : cft;
+              if(fp_is_nan(s->cpr1[rg], cdbl) && g_ftaint[rg].kind != 0) {
+                inh = g_ftaint[rg]; break;
+              }
+            }
+            if(inh.kind == 0) {
+              inh.icnt = s->icnt; inh.pc = (uint32_t)s->pc; inh.inst = inst; inh.kind = 1;
+            }
+            if(cfn < 0x30) {   /* compares write a cc, not an FP register */
+              g_pend_taint = inh; g_pend_reg = (int)cfd; g_pend_dbl = cdbl;
+            }
+          }
+          else if(cfn == 6) {   /* mov.fmt: a pure copy, carry the tag */
+            g_pend_taint = g_ftaint[cfs]; g_pend_reg = (int)cfd; g_pend_dbl = cdbl;
+          }
+        }
+        else if(op6 == 0x11 && (cfmt == 4 || cfmt == 5)) {   /* mtc1 / dmtc1 */
+          nan_taint_t t; t.icnt = s->icnt; t.pc = (uint32_t)s->pc; t.inst = inst; t.kind = 2;
+          g_pend_taint = t; g_pend_reg = (int)cfs; g_pend_dbl = (cfmt == 5);
+        }
+        else if(op6 == 0x31 || op6 == 0x35) {   /* lwc1 / ldc1 -- inherit through memory */
+          uint64_t ea = (uint64_t)(s->gpr[(inst >> 21) & 31] + (int32_t)(int16_t)(inst & 0xffff));
+          nan_taint_t t; t.kind = 0;
+          if(!g_mtaint.empty()) {
+            auto it = g_mtaint.find(ea);
+            if(it != g_mtaint.end()) { t = it->second; }
+          }
+          if(t.kind == 0) {   /* no FP store we saw wrote this: EXTERN if it is a NaN */
+            t.icnt = s->icnt; t.pc = (uint32_t)s->pc; t.inst = inst; t.kind = 2; t.addr = ea;
+          }
+          g_pend_taint = t; g_pend_reg = (int)cft; g_pend_dbl = (op6 == 0x35);
+        }
+        else if(op6 == 0x39 || op6 == 0x3d) {   /* swc1 / sdc1 -- carry the tag into memory */
+          uint64_t ea = (uint64_t)(s->gpr[(inst >> 21) & 31] + (int32_t)(int16_t)(inst & 0xffff));
+          bool sdbl = (op6 == 0x3d);
+          if(fp_is_nan(s->cpr1[cft], sdbl)) {
+            g_mtaint[ea] = g_ftaint[cft];
+          }
+          else if(!g_mtaint.empty()) {
+            g_mtaint.erase(ea);
+          }
+        }
+      }
+      /* Only snapshot around instructions that can ARCHITECTURALLY write an FP
+       * register -- COP1/COP1X arith+moves and the FP loads.  Everything else
+       * cannot change cpr1[], so scanning after it is wasted work (this keeps
+       * the probe off the hot path of an otherwise integer instruction mix). */
+      uint32_t pop = inst >> 26;
+      ph = (pop == 0x11) || (pop == 0x13) || (pop == 0x31) || (pop == 0x35);
+      if(ph) {
+        for(int k = 0; k < 32; k++) {
+          pdbl_v[k] = (s->cpr1_state[k] != fp_reg_state::sp) ? 1 : 0;
+        }
+        memcpy(pf, s->cpr1, sizeof(pf));
+        ppc = (uint32_t)s->pc; pinst = inst; picnt = s->icnt;
+      }
+    }
+  }
+  if constexpr(DBG) { /* PCHASH: rolling FNV-1a over the retired-PC stream, checkpoint every 65536.
+     * Compared against henry_tb's identical hash to find the first RTL/ISS PC
+     * divergence (expected only once interrupts skew the streams). */
+    static const bool g_pchash = getenv("PCHASH") != nullptr;
+    if(g_pchash) {
+      static uint64_t h = 1469598103934665603ULL;
+      h = (h ^ (uint32_t)s->pc) * 1099511628211ULL;
+      if((s->icnt & 0xffff) == 0) {
+        fprintf(stderr, "[pchash] icnt=%llu hash=%016llx pc=%08x\n",
+                (unsigned long long)s->icnt, (unsigned long long)h, (uint32_t)s->pc);
+      }
+    }
+    static const char *pd = getenv("PCDUMP");   /* "lo:hi" -> raw "P <pc>" for structural diff */
+    static uint64_t pd_lo = 0, pd_hi = 0; static bool pd_init = false;
+    if(!pd_init) { pd_init = true; if(pd) sscanf(pd, "%lu:%lu", &pd_lo, &pd_hi); }
+    if(pd && s->icnt >= pd_lo && s->icnt < pd_hi) {
+      fprintf(stderr, "P %08x\n", (uint32_t)s->pc);
+    }
+  }
+  if(DBG and globals::trace_retirement and globals::retire_log) {
+    /* optional TRACEWIN=lo:hi icnt window so a huge boot can emit a small,
+     * focused retire_trace (e.g. around a single XTLB refill) for mips-analyzer. */
+    static bool tw_init = false; static uint64_t tw_lo = 0, tw_hi = ~0ULL, tw_cap = 0, tw_ring = 0;
+    static bool tw_useronly = false, tw_kernonly = false, tw_trig_user = false, tw_armed = false;
+    static uint32_t tw_freeze_pc = 0;
+    static uint64_t tw_freeze_n = 1, tw_freeze_hits = 0;
+    static uint32_t tw_pc_lo = 0, tw_pc_hi = 0;
+    if(!tw_init) { tw_init = true; const char *tw = getenv("TRACEWIN");
+                   if(tw) sscanf(tw, "%lu:%lu", &tw_lo, &tw_hi);
+                   tw_useronly = getenv("TRACEWIN_USERONLY") != nullptr;
+                   tw_kernonly = getenv("TRACEWIN_KERNELONLY") != nullptr;   // pc >= 0x80000000 only: a
+                                                                             // ring of the net STACK, not
+                                                                             // the user loop between packets
+                   { const char *fp = getenv("TRACEWIN_FREEZE_PC");
+                     if(fp) tw_freeze_pc = strtoul(fp, nullptr, 0);
+                     const char *fn = getenv("TRACEWIN_FREEZE_N");
+                     if(fn) tw_freeze_n = strtoull(fn, nullptr, 0);
+                     const char *pl = getenv("TRACEWIN_PC_LO"), *ph = getenv("TRACEWIN_PC_HI");
+                     if(pl) tw_pc_lo = strtoul(pl, nullptr, 0);
+                     if(ph) tw_pc_hi = strtoul(ph, nullptr, 0); }
+                   tw_trig_user = getenv("TRACEWIN_TRIG_USER") != nullptr;      // arm on first o32 entry
+                   if(getenv("TRACEWIN_N")) tw_cap = strtoull(getenv("TRACEWIN_N"),0,0);
+                   if(getenv("TRACEWIN_RING")) tw_ring = strtoull(getenv("TRACEWIN_RING"),0,0);  // keep LAST N
+                   if(tw || tw_ring) fprintf(stderr, "[tracewin] lo=%llu hi=%llu useronly=%d cap=%llu ring=%llu\n",
+                                  (unsigned long long)tw_lo, (unsigned long long)tw_hi, tw_useronly,
+                                  (unsigned long long)tw_cap, (unsigned long long)tw_ring); }
+    if(tw_trig_user && !tw_armed && (uint32_t)s->pc < 0x80000000u) tw_armed = true;
+    if(!g_ring_frozen && s->icnt >= tw_lo && s->icnt < tw_hi && (!tw_trig_user || tw_armed)
+       && (tw_ring != 0 || tw_cap == 0 || globals::retire_log->get_records().size() < tw_cap)
+       && !(tw_useronly && (uint32_t)s->pc >= 0x80000000u)
+       && !(tw_kernonly && (uint32_t)s->pc <  0x80000000u)
+       && !(tw_pc_hi && ((uint32_t)s->pc < tw_pc_lo || (uint32_t)s->pc >= tw_pc_hi))) {
+      auto &recs = globals::retire_log->get_records();
+      recs.emplace_back(ipa, (uint64_t)s->pc, inst);
+      /* TRACEWIN_RING=N: keep only the last N records (trace the run-up to a crash,
+       * regardless of exact icnt). std::list pop_front is O(1). */
+      if(tw_ring != 0 && recs.size() > tw_ring) recs.pop_front();
+      if(tw_freeze_pc && (uint32_t)s->pc == tw_freeze_pc && tw_ring != 0 && recs.size() >= tw_ring
+         && (++tw_freeze_hits >= tw_freeze_n)) {
+        g_ring_frozen = true;
+        /* Force a CLEAN exit ~1 insn later so main() serializes the trace (a kill -9
+         * would discard it -- the boost archive is written only at normal exit). The
+         * ring is already frozen, so the trailing insns don't pollute it. */
+        s->maxicnt = s->icnt + 1;
+        fprintf(stderr, "[tracewin] froze ring at pc=%08x icnt=%llu (exiting to flush)\n",
+                tw_freeze_pc, (unsigned long long)s->icnt);
+      }
+    }
+  }
+  /* ASIDPC=<file>: per USERSPACE retire, dump (asid<<32 | vpc) as an 8-byte LE record.
+   * Offline: find be's ASID (the asid seen at vpc==0e788bc0), filter to it -> a be-only
+   * PC golden that aligns to the ASID-filtered silicon deep trace to locate the fork. */
+  if constexpr(DBG) { static FILE* g_asidpc = [](){ const char* p = getenv("ASIDPC"); return p ? fopen(p, "wb") : (FILE*)nullptr; }();
+    if(g_asidpc && globals::asidpc_armed && (uint32_t)s->pc < 0x80000000u) {
+      uint64_t rec = ((uint64_t)(s->cpr0_64[CPR0_ENTRYHI] & 0xffULL) << 32) | (uint32_t)s->pc;
+      fwrite(&rec, 8, 1, g_asidpc);
+    } }
+  if(DBG and globals::pctrace) {
+    static const bool useronly = getenv("PCTRACE_USERONLY") != nullptr;  /* only pc<0x80000000 */
+    if(!globals::pctrace_on && (uint32_t)s->pc == globals::pctrace_start) globals::pctrace_on = true;
+    if(globals::pctrace_on && !(useronly && (uint32_t)s->pc >= 0x80000000u))
+      fprintf(globals::pctrace, "%08x\n", (uint32_t)s->pc);
+  }
+ 
+  
+  
+  /* decoded-instruction cache (Bedichek, "decode once, execute many"): the slot for
+   * this physical word holds the handler; re-decoded whenever the word changed */
+  dinst_t *di = &g_fc_dpage[(ipa >> 2) & (DPAGE_SLOTS - 1)];
+  if(di->fn == nullptr || di->inst != inst) {
+    di->inst = inst;
+    di->fn = decode_insn<EL>(inst);
+  }
+  di->fn(inst, s);
 }

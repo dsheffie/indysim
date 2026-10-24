@@ -74,7 +74,8 @@ $(CHD_LIB):
 chd_reader.o: chd_reader.cc
 	$(CXX) -MMD $(CXXFLAGS) -Ilibchdr/include -c $<
 
-githash.cc : .git/HEAD .git/index
+GITDIR := $(shell git rev-parse --git-dir)
+githash.cc : $(GITDIR)/HEAD $(GITDIR)/index
 	echo "const char *githash = \"$(shell git rev-parse HEAD)\";" > $@
 
 %.o: %.cc
