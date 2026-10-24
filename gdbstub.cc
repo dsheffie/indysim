@@ -165,6 +165,7 @@ void gdb_stub::write_registers(state_t *s, const std::string &h) {
   size_t o = 0;
   for(int i = 0; i < 32; i++) { s->gpr[i] = (int64_t)rd(o, 8); o += 16; }
   s->cpr0[CPR0_SR] = (uint32_t)rd(o, 8); o += 16;
+  xctx_update(s);
   s->lo = (int64_t)rd(o, 8); o += 16;
   s->hi = (int64_t)rd(o, 8); o += 16;
   o += 16;                                            /* badvaddr (read-only) */

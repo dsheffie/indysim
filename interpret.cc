@@ -237,6 +237,7 @@ void initState(state_t *s) {
   /* Matches the RTL's cpr0_status_reg reset in exec.sv: CU1 resets 0 (R/W,
    * lazy-FPU) -- FP is enabled by the OS on the first-use CpU trap, NOT at reset. */
   s->cpr0[CPR0_SR] |= SR_ERL | SR_BEV | SR_CU0 | SR_CU2;
+  xctx_update(s);
   /* Random starts at max TLB index; it cycles downward to Wired */
   s->cpr0[CPR0_RANDOM] = state_t::NUM_TLB_ENTRIES - 1;
   /* PRId: read-only processor id (R4000 family for now) */
@@ -331,6 +332,7 @@ static inline void raise_common(state_t *s, uint32_t exccode) {
   bool exl_was_set = (s->cpr0[CPR0_SR] & SR_EXL) != 0;
   s->cpr0[CPR0_CAUSE] = (s->cpr0[CPR0_CAUSE] & ~(0x1fu << 2)) | (exccode << 2);
   s->cpr0[CPR0_SR]    = (s->cpr0[CPR0_SR] & ~SR_ERL) | SR_EXL;
+  xctx_update(s);
   s->ll_armed = false;   /* any exception breaks the load-linked reservation */
   s->pc = sext32(exc_vector(s, /*is_refill=*/false, exl_was_set, /*xtlb=*/false));
 }
@@ -480,6 +482,7 @@ static void take_exception_cpu(state_t *s, uint32_t ce) {
   s->cpr0[CPR0_CAUSE] = (s->cpr0[CPR0_CAUSE] & ~(0x1fu << 2) & ~(0x3u << 28))
                         | (11u << 2) | ((ce & 0x3u) << 28);
   s->cpr0[CPR0_SR]    = (s->cpr0[CPR0_SR] & ~SR_ERL) | SR_EXL;
+  xctx_update(s);
   s->ll_armed = false;
   s->pc = sext32(exc_vector(s, /*is_refill=*/false, exl_was_set, /*xtlb=*/false));
 }
@@ -494,6 +497,7 @@ static void take_exception_fpe(state_t *s) {
   bool exl_was_set = (s->cpr0[CPR0_SR] & SR_EXL) != 0;
   s->cpr0[CPR0_CAUSE] = (s->cpr0[CPR0_CAUSE] & ~(0x1fu << 2)) | (15u << 2);
   s->cpr0[CPR0_SR]    = (s->cpr0[CPR0_SR] & ~SR_ERL) | SR_EXL;
+  xctx_update(s);
   s->fcr1[CP1_CR31]  |= (1u << 17);
   s->ll_armed = false;
   s->pc = sext32(exc_vector(s, /*is_refill=*/false, exl_was_set, /*xtlb=*/false));
@@ -671,6 +675,7 @@ void raise_int(state_t *s, uint32_t epc) {
   s->cpr0[CPR0_EPC]   = epc;
   s->cpr0[CPR0_CAUSE] = (1u << 15);  /* IP[7]=1 (timer), ExcCode=0, BD=0 */
   s->cpr0[CPR0_SR]    = (s->cpr0[CPR0_SR] & ~SR_ERL) | SR_EXL;
+  xctx_update(s);
   s->pc = sext32(0xBFC00180u);
 }
 
@@ -781,6 +786,7 @@ static void tlb_set_fault_state(state_t *s, uint64_t va) {
   uint64_t ehi  = (r << 62) | (vpn2 << 13) | asid;
   s->cpr0_64[CPR0_ENTRYHI] = ehi;
   s->cpr0[CPR0_ENTRYHI]    = (uint32_t)ehi;
+  xctx_update(s);
 
   /* Context: [22:4] = VA[31:13]; preserve PTEBase [63:23] */
   uint64_t ctx = s->cpr0_64[CPR0_CONTEXT] & ~0x7fffffULL;
@@ -936,6 +942,7 @@ static void raise_tlb(state_t *s, uint64_t va, uint32_t exccode,
   set_exc_pc(s);
   s->cpr0[CPR0_CAUSE] = (s->cpr0[CPR0_CAUSE] & ~(0x1fu << 2)) | (exccode << 2);
   s->cpr0[CPR0_SR]    = (s->cpr0[CPR0_SR] & ~SR_ERL) | SR_EXL;
+  xctx_update(s);
   s->pc = sext32(exc_vector(s, is_refill && !exl_was_set, exl_was_set, is_xtlb));
   s->tlb_fault = true;
 }
@@ -961,9 +968,20 @@ static utlb_entry g_utlb[UTLB_SZ];
  * translation.  A hit needs the same VA page, ASID and Status, so exceptions/ERET/mtc0
  * Status/EntryHi changes miss by construction; only TLB writes must flush it. */
 static bool g_fc_valid = false;
-static uint64_t g_fc_vpage = 0, g_fc_asid = 0;
-static uint32_t g_fc_sr = 0, g_fc_ppage = 0;
+static uint64_t g_fc_vpage = 0;
+static uint32_t g_fc_ppage = 0;
 static inline void dfast_flush();
+/* translation context: ASID | the SR mode bits (EXL ERL KSU UX SX KX).  Kept in g_xctx by
+ * xctx_update() at every SR / EntryHi write, so the fetch cache and the soft TLB check one
+ * word instead of re-reading CP0 per access (the DBG instance verifies it every insn). */
+uint64_t g_xctx = 0;
+static inline uint64_t xctx_compute(const state_t *s) {
+  return (s->cpr0_64[CPR0_ENTRYHI] & 0xffULL) | ((uint64_t)(s->cpr0[CPR0_SR] & 0xfeu) << 8);
+}
+void xctx_update(state_t *s) {
+  g_xctx = xctx_compute(s);
+  g_fc_valid = false;
+}
 static inline void utlb_flush() { for(auto &e : g_utlb) e.valid = false; g_fc_valid = false; dfast_flush(); }
 
 /* TLBDUP (env-gated): after a TLBWI/TLBWR installs entry `idx`, scan for ANOTHER
@@ -1371,6 +1389,10 @@ static uint32_t ip22_probe_window(state_t *s, uint32_t pa, tlb_op op) {
   return (op == tlb_op::store ? 0x2ffff000u : 0x2fffe000u) | (pa & 0xfffu);
 }
 
+/* set by va_translate_slow when its result must not go into the soft TLB (the PROM's bank-
+ * probe window maps the same PA to different memory as MEMCFG changes) */
+static bool g_xlat_uncacheable = false;
+
 static __attribute__((noinline)) uint32_t va_translate_slow(state_t *s, uint64_t va, tlb_op op) {
 #ifdef ENABLE_CACHE_MODEL
   if(g_wsprof && op == tlb_op::store) {                 /* WS profiler markers */
@@ -1382,8 +1404,10 @@ static __attribute__((noinline)) uint32_t va_translate_slow(state_t *s, uint64_t
   }
 #endif
   uint32_t pa = va_translate_inner(s, va, op);
+  g_xlat_uncacheable = false;
   if((pa >> 28) == 2 && s->mc) {
     pa = ip22_probe_window(s, pa, op);
+    g_xlat_uncacheable = true;               /* depends on MEMCFG, not the TLB: never cache */
   }
   static const bool g_nvlog = getenv("NVLOG") != nullptr;
   if(g_nvlog and op == tlb_op::load
@@ -1435,8 +1459,8 @@ static const bool g_dfast_on = [](){
   return true;
 }();
 
-static inline uint64_t dfast_ctx(const state_t *s) {
-  return (s->cpr0_64[CPR0_ENTRYHI] & 0xffULL) | ((uint64_t)(s->cpr0[CPR0_SR] & 0xfeu) << 8);
+static inline uint64_t dfast_ctx(const state_t *) {
+  return g_xctx;
 }
 
 static inline void dfast_flush() {
@@ -1454,7 +1478,8 @@ static inline uint32_t va_translate(state_t *s, uint64_t va, tlb_op op) {
     return e.ppage | (uint32_t)(va & 0xfffULL);
   }
   const uint32_t pa = va_translate_slow(s, va, op);
-  if(g_dfast_on && !s->tlb_fault && !g_mem_hooks && pa >= 0x08000000u && pa < 0x18000000u) {
+  if(g_dfast_on && !s->tlb_fault && !g_mem_hooks && !g_xlat_uncacheable &&
+     pa >= 0x08000000u && pa < 0x18000000u) {
     e.writable = (op == tlb_op::store) || (e.vpage == vpage && e.ctx1 == ctx1 && e.writable);
     e.vpage = vpage;
     e.ctx1 = ctx1;
@@ -3872,6 +3897,7 @@ static void exec_generic(uint32_t inst, state_t *s) {
 	    s->cpr0_64[CPR0_ENTRYLO0] = s->tlb[idx].entry_lo0;
 	    s->cpr0_64[CPR0_ENTRYLO1] = s->tlb[idx].entry_lo1;
 	    s->cpr0[CPR0_ENTRYHI]     = (uint32_t)s->tlb[idx].entry_hi;
+	    xctx_update(s);
 	    s->cpr0[CPR0_ENTRYLO0]    = (uint32_t)s->tlb[idx].entry_lo0;
 	    s->cpr0[CPR0_ENTRYLO1]    = (uint32_t)s->tlb[idx].entry_lo1;
 	    s->cpr0[CPR0_PAGEMASK]    = s->tlb[idx].page_mask;
@@ -3975,6 +4001,7 @@ static void exec_generic(uint32_t inst, state_t *s) {
 	    s->cpr0[CPR0_SR] &= ~SR_EXL;
 	  }
 	  s->ll_armed = false;   /* R4000: ERET clears LLbit */
+	  xctx_update(s);
 	  HISTO(s, mipsInsn::ERET);
 	  break;
 	}
@@ -4038,6 +4065,9 @@ static void exec_generic(uint32_t inst, state_t *s) {
 	                                        : (uint64_t)(int64_t)(int32_t)s->gpr[rt];
 	      s->cpr0_64[rd] = cp0_write_mask(rd, v); }
 	    s->cpr0[rd] = (uint32_t)s->cpr0_64[rd];
+	    if(rd == CPR0_SR || rd == CPR0_ENTRYHI) {
+	      xctx_update(s);
+	    }
 	  }
 	  ptetrack_probe(s, rd, rt);
 	  if(rd == CPR0_COMPARE) { /* writing Compare re-arms + clears the timer interrupt (IP[7]) */
@@ -4112,6 +4142,9 @@ static void exec_generic(uint32_t inst, state_t *s) {
 	  if(rd != 15) { /* PRId (reg 15) is read-only */
 	    s->cpr0_64[rd] = cp0_write_mask(rd, s->gpr[rt]);
 	    s->cpr0[rd] = (uint32_t)s->cpr0_64[rd];
+	    if(rd == CPR0_SR || rd == CPR0_ENTRYHI) {
+	      xctx_update(s);
+	    }
 	  }
 	  ptetrack_probe(s, rd, rt);
 	  if(rd == 7 && !s->silent) {
@@ -6406,8 +6439,6 @@ static __attribute__((noinline)) bool fetch_refill(state_t *s, uint32_t *ipa_out
   /* UITLBSTATS models every fetch, so it keeps the cache off */
   g_fc_valid = (g_uitlb_interval == 0);
   g_fc_vpage = (uint64_t)s->pc >> 12;
-  g_fc_asid = s->cpr0_64[CPR0_ENTRYHI] & 0xffULL;
-  g_fc_sr = s->cpr0[CPR0_SR];
   g_fc_ppage = ipa & ~0xfffu;
   g_fc_dpage = dpage_for(ipa);
   /* RAM and PROM pages are plain memory: fetch straight from the host page.  The MC/
@@ -6432,8 +6463,15 @@ void execMips(state_t *s) {
   s->gpr[0] = 0;   /* MIPS $0 is hardwired to zero; e.g. `mflo $0` must not stick */
   s->tlb_fault = false;
   uint32_t ipa;
-  if(__builtin_expect(g_fc_valid && ((uint64_t)s->pc >> 12) == g_fc_vpage &&
-            (s->cpr0_64[CPR0_ENTRYHI] & 0xffULL) == g_fc_asid && s->cpr0[CPR0_SR] == g_fc_sr, 1)) {
+  if constexpr(DBG) {
+    if(g_xctx != xctx_compute(s)) {
+      fprintf(stderr, "[xctx] STALE translation context at pc=%08x icnt=%llu: %llx vs %llx\n",
+              (uint32_t)s->pc, (unsigned long long)s->icnt, (unsigned long long)g_xctx,
+              (unsigned long long)xctx_compute(s));
+      abort();
+    }
+  }
+  if(__builtin_expect(g_fc_valid && ((uint64_t)s->pc >> 12) == g_fc_vpage, 1)) {
     ipa = g_fc_ppage | (uint32_t)(s->pc & 0xfffULL);
 #ifdef ENABLE_CACHE_MODEL
     s->mem.cache_active = false;   /* as va_translate does: fetches are uncached in cache_model */

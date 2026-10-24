@@ -295,6 +295,7 @@ int main(int argc, char *argv[]) {
 
   if(!restore_name.empty()) {
     loadState(*s, restore_name);
+    xctx_update(s);
     std::cerr << "restored checkpoint " << restore_name << " -> pc=" << std::hex
               << (uint32_t)s->pc << " icnt=" << std::dec << s->icnt << "\n";
   }
