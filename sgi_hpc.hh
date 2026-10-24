@@ -2,6 +2,7 @@
 #define __sgi_hpc__
 
 #include <cstdint>
+#include <ctime>
 #include <cstddef>
 
 struct state_t;
@@ -31,6 +32,8 @@ class sgi_hpc {
    * time + rtc_offset once the guest has set it), 0xb.. = battery-backed RAM. */
   uint8_t rtc_ram[0x2000] = {0};
   int64_t rtc_offset = 0;
+  time_t rtc_lt_time = (time_t)-1;   /* rtc_read's cached calendar: valid for this second */
+  struct tm rtc_lt = {};
   uint8_t rtc_read(uint32_t reg);
   void rtc_write(uint32_t reg, uint8_t v);
   uint32_t pbus_dma_config[8] = {0}; /* reg 0x5c000 block: per-channel DMA config (8 ch) */

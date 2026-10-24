@@ -351,9 +351,15 @@ int main(int argc, char *argv[]) {
   static const bool lean = false;
 #endif
   
-  if(lean) {
+  if(lean and s->maxicnt == ~(0UL)) {
     while(not(s->brk)) {
       maybe_take_interrupt(s);   /* CP0 Count/Compare timer + Int delivery (per step) */
+      execMips(s);
+    }
+  }
+  else if(lean) {                /* -m given: also stop at maxicnt */
+    while(not(s->brk) and s->icnt < s->maxicnt) {
+      maybe_take_interrupt(s);
       execMips(s);
     }
   }

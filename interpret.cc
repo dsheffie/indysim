@@ -327,7 +327,7 @@ static inline void raise_common(state_t *s, uint32_t exccode) {
  * banner uses polled serial whose RR0 wait depends on the per-instruction drain
  * timing, so throttling tick() hangs the boot. TODO: once every device is
  * modeled, replace this poll with a device-sets-a-flag scheme (the "right way"). */
-static const uint64_t INT_POLL = getenv("INT_POLL") ? strtoull(getenv("INT_POLL"),0,0) : 1;
+static const uint64_t INT_POLL = getenv("INT_POLL") ? strtoull(getenv("INT_POLL"),0,0) : 64;
 
 /* env-gated TLB/timer tally (TLBTALLY=1): compare against the FPGA bad-istack trigger */
 static uint64_t g_ty_timer=0, g_ty_tlbmiss=0, g_ty_idle_tlbmiss=0, g_ty_timer_in_tlbmiss=0, g_ty_timer_idle=0, g_ty_pda_miss=0;

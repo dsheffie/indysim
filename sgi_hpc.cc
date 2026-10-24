@@ -622,9 +622,17 @@ uint8_t sgi_hpc::rtc_read(uint32_t reg) {
       default:  return 0x00;   /* sec/min/hour/cmd = 0 (BCD 00) */
       }
   }
+  if(reg == 0x0) {
+    return to_bcd(rtc_hundredths(s));            /* hundredths: no calendar needed */
+  }
+  /* localtime_r costs ~1K host instructions and the guest polls the clock, so only
+   * recompute the calendar when the second changes */
   const time_t now = rtc_now(s) + (time_t)rtc_offset;
-  struct tm lt;
-  localtime_r(&now, &lt);
+  if(now != rtc_lt_time) {
+    localtime_r(&now, &rtc_lt);
+    rtc_lt_time = now;
+  }
+  const struct tm &lt = rtc_lt;
   switch(reg)
     {
     case 0x1: return to_bcd(lt.tm_sec);          /* seconds */
@@ -634,7 +642,6 @@ uint8_t sgi_hpc::rtc_read(uint32_t reg) {
     case 0x8: return to_bcd(lt.tm_mday);         /* date (1-31) */
     case 0x9: return to_bcd(lt.tm_mon + 1);      /* month (1-12); EOSC/ESQW = 0 (running) */
     case 0xa: return to_bcd(lt.tm_year % 100);   /* year (BCD 2-digit) */
-    case 0x0: return to_bcd(rtc_hundredths(s));  /* hundredths */
     default:  return rtc_ram[reg];               /* alarms -> stored */
     }
 }
