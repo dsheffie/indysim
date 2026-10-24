@@ -59,6 +59,7 @@ namespace globals {
   uint64_t icountMIPS = 0;
   uint64_t cycle = 0;
   bool trace_retirement = false;
+  bool exec_dbg = false;
   bool trace_fp = false;
   bool report_syscalls = false;
   retire_trace *retire_log = nullptr;
@@ -69,6 +70,33 @@ namespace globals {
   bool cpu_r5000 = false;
 };
 static state_t *s = nullptr;
+
+/* the lean main loop; DBG picks execMips' instance once, outside the loop */
+template <bool DBG>
+static void lean_loop(state_t *s) {
+  if(s->maxicnt == ~(0UL)) {
+    while(not(s->brk)) {
+      maybe_take_interrupt(s);   /* CP0 Count/Compare timer + Int delivery (per step) */
+      if constexpr(DBG) {
+        execMips(s);
+      }
+      else {
+        execMipsFast(s);
+      }
+    }
+  }
+  else {                         /* -m given: also stop at maxicnt */
+    while(not(s->brk) and s->icnt < s->maxicnt) {
+      maybe_take_interrupt(s);
+      if constexpr(DBG) {
+        execMips(s);
+      }
+      else {
+        execMipsFast(s);
+      }
+    }
+  }
+}
 
 int main(int argc, char *argv[]) {
   bool retiretrace_signal = false;
@@ -351,16 +379,13 @@ int main(int argc, char *argv[]) {
   static const bool lean = false;
 #endif
   
-  if(lean and s->maxicnt == ~(0UL)) {
-    while(not(s->brk)) {
-      maybe_take_interrupt(s);   /* CP0 Count/Compare timer + Int delivery (per step) */
-      execMips(s);
+  globals::exec_dbg = exec_debug_requested() or not(retire_name.empty()) or (globals::pctrace != nullptr);
+  if(lean) {
+    if(globals::exec_dbg) {
+      lean_loop<true>(s);
     }
-  }
-  else if(lean) {                /* -m given: also stop at maxicnt */
-    while(not(s->brk) and s->icnt < s->maxicnt) {
-      maybe_take_interrupt(s);
-      execMips(s);
+    else {
+      lean_loop<false>(s);
     }
   }
 

@@ -350,6 +350,8 @@ static inline uint32_t get_branch_target(uint32_t pc, uint32_t inst) {
 void initState(state_t *s);
 void tlbpm_report();   /* TLBPMSTATS: tlbwi/tlbwr page-size histogram (SIGUSR1) */
 void execMips(state_t *s);
+void execMipsFast(state_t *s);      /* the DBG=false instance: no per-instruction debug hooks */
+bool exec_debug_requested();        /* any of execMips' per-instruction debug knobs set? */
 
 /* checkpoint save/restore (saveState.cc) -- full arch state + non-zero pages */
 void dumpState(const state_t &s, const std::string &filename);

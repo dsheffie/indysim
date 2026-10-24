@@ -126,10 +126,34 @@ state_t::~state_t() {
 static void execCoproc0(uint32_t inst, state_t *s);
 static void execCoproc2(uint32_t inst, state_t *s);
 
-template <bool EL> void execMips(state_t *s);
+/* DBG instantiates the per-instruction debug/trace hooks (the getenv knobs below,
+ * --retiretrace, PCTRACE).  globals::exec_dbg (set once in main) picks the instance;
+ * the DBG=false one carries none of them.  See exec_debug_requested(). */
+template <bool EL, bool DBG> void execMips(state_t *s);
 
 void execMips(state_t *s) {
-  execMips<IS_LITTLE_ENDIAN>(s);
+  if(globals::exec_dbg) {
+    execMips<IS_LITTLE_ENDIAN, true>(s);
+  }
+  else {
+    execMips<IS_LITTLE_ENDIAN, false>(s);
+  }
+}
+
+void execMipsFast(state_t *s) {
+  execMips<IS_LITTLE_ENDIAN, false>(s);
+}
+
+/* any per-instruction debug knob set?  (the env-gated blocks in execMips' DBG instance) */
+bool exec_debug_requested() {
+  static const char *knobs[] = {"DISPROBE", "RETLO", "FPTRAPCOUNT", "NANWATCH", "PCHASH",
+                                "PCDUMP", "ASIDPC"};
+  for(const char *k : knobs) {
+    if(getenv(k) != nullptr) {
+      return true;
+    }
+  }
+  return false;
 }
 
 static const bool g_cache_dbg = getenv("CACHEDBG") != nullptr;
@@ -501,7 +525,12 @@ static inline bool run_delay_slot(state_t *s) {
   bool exl_before = (s->cpr0[CPR0_SR] & SR_EXL) != 0;
   bool saved = s->in_delay_slot;
   s->in_delay_slot = true;
-  execMips<EL>(s);
+  if(globals::exec_dbg) {
+    execMips<EL, true>(s);
+  }
+  else {
+    execMips<EL, false>(s);
+  }
   s->in_delay_slot = saved;
   return (!exl_before) && ((s->cpr0[CPR0_SR] & SR_EXL) != 0);
 }
@@ -3269,7 +3298,7 @@ bool is_store_insn(state_t *s) {
 }
 
 
-template <bool EL>
+template <bool EL, bool DBG>
 void execMips(state_t *s) {
   sparse_mem &mem = s->mem;
   s->gpr[0] = 0;   /* MIPS $0 is hardwired to zero; e.g. `mflo $0` must not stick */
@@ -3294,7 +3323,7 @@ void execMips(state_t *s) {
     g_fc_ppage = ipa & ~0xfffu;
   }
   uint32_t inst = bswap<EL>(mem.get<uint32_t>(ipa));
-  { static const bool g_dis = getenv("DISPROBE") != nullptr;
+  if constexpr(DBG) { static const bool g_dis = getenv("DISPROBE") != nullptr;
     static uint32_t seen[128]; static int nseen=0;
     uint32_t pc32=(uint32_t)s->pc;
     bool inrange = (pc32>=0x0e636948u && pc32<0x0e6369c0u) || (pc32>=0x0e635d00u && pc32<0x0e635d60u);
@@ -3333,7 +3362,7 @@ void execMips(state_t *s) {
   /* RETLOG: scoped (icnt in [RETLO,RETHI]) retire log mirroring the silicon flight recorder
    * (pc + first-changed-GPR + value), emitted for the PREVIOUS instruction (its result is now
    * visible in s->gpr).  Used to align golden vs the silicon window and find the first divergence. */
-  { static const uint64_t rlo = getenv("RETLO") ? strtoull(getenv("RETLO"),0,0) : 0;
+  if constexpr(DBG) { static const uint64_t rlo = getenv("RETLO") ? strtoull(getenv("RETLO"),0,0) : 0;
     static const uint64_t rhi = getenv("RETHI") ? strtoull(getenv("RETHI"),0,0) : 0;
     static int64_t pg[32]; static uint32_t ppc=0; static uint64_t picnt=0; static bool ph=false;
     if(rlo && s->icnt>=rlo && s->icnt<=rhi) {
@@ -3361,7 +3390,7 @@ void execMips(state_t *s) {
    * Format comes from cpr1_state[]; `unknown` is read as double (the FP codes
    * under test -- turb3d/apsi/hydro2d -- are double precision).
    * NANWATCH_MINICNT skips the boot so daemons//etc/init noise is suppressed. */
-  { /* periodic FP-trap census: the process may be killed rather than exit
+  if constexpr(DBG) { /* periodic FP-trap census: the process may be killed rather than exit
      * cleanly, and on a long soak we want the trend, not just a final total. */
     static const uint64_t g_ftc = getenv("FPTRAPCOUNT") ? strtoull(getenv("FPTRAPCOUNT"),0,0) : 0;
     if(g_ftc > 1 && (s->icnt % g_ftc) == 0) {
@@ -3379,7 +3408,7 @@ void execMips(state_t *s) {
       fprintf(stderr, "\n");
     }
   }
-  { static const uint64_t g_nanwatch = getenv("NANWATCH") ? strtoull(getenv("NANWATCH"),0,0) : 0;
+  if constexpr(DBG) { static const uint64_t g_nanwatch = getenv("NANWATCH") ? strtoull(getenv("NANWATCH"),0,0) : 0;
     static const uint64_t g_nw_min = getenv("NANWATCH_MINICNT") ? strtoull(getenv("NANWATCH_MINICNT"),0,0) : 0;
     if(g_nanwatch && s->icnt >= g_nw_min) {
       static uint64_t pf[32]; static uint8_t pdbl_v[32];
@@ -3533,7 +3562,7 @@ void execMips(state_t *s) {
       }
     }
   }
-  { /* PCHASH: rolling FNV-1a over the retired-PC stream, checkpoint every 65536.
+  if constexpr(DBG) { /* PCHASH: rolling FNV-1a over the retired-PC stream, checkpoint every 65536.
      * Compared against henry_tb's identical hash to find the first RTL/ISS PC
      * divergence (expected only once interrupts skew the streams). */
     static const bool g_pchash = getenv("PCHASH") != nullptr;
@@ -3552,7 +3581,7 @@ void execMips(state_t *s) {
       fprintf(stderr, "P %08x\n", (uint32_t)s->pc);
     }
   }
-  if(globals::trace_retirement and globals::retire_log) {
+  if(DBG and globals::trace_retirement and globals::retire_log) {
     /* optional TRACEWIN=lo:hi icnt window so a huge boot can emit a small,
      * focused retire_trace (e.g. around a single XTLB refill) for mips-analyzer. */
     static bool tw_init = false; static uint64_t tw_lo = 0, tw_hi = ~0ULL, tw_cap = 0, tw_ring = 0;
@@ -3605,12 +3634,12 @@ void execMips(state_t *s) {
   /* ASIDPC=<file>: per USERSPACE retire, dump (asid<<32 | vpc) as an 8-byte LE record.
    * Offline: find be's ASID (the asid seen at vpc==0e788bc0), filter to it -> a be-only
    * PC golden that aligns to the ASID-filtered silicon deep trace to locate the fork. */
-  { static FILE* g_asidpc = [](){ const char* p = getenv("ASIDPC"); return p ? fopen(p, "wb") : (FILE*)nullptr; }();
+  if constexpr(DBG) { static FILE* g_asidpc = [](){ const char* p = getenv("ASIDPC"); return p ? fopen(p, "wb") : (FILE*)nullptr; }();
     if(g_asidpc && globals::asidpc_armed && (uint32_t)s->pc < 0x80000000u) {
       uint64_t rec = ((uint64_t)(s->cpr0_64[CPR0_ENTRYHI] & 0xffULL) << 32) | (uint32_t)s->pc;
       fwrite(&rec, 8, 1, g_asidpc);
     } }
-  if(globals::pctrace) {
+  if(DBG and globals::pctrace) {
     static const bool useronly = getenv("PCTRACE_USERONLY") != nullptr;  /* only pc<0x80000000 */
     if(!globals::pctrace_on && (uint32_t)s->pc == globals::pctrace_start) globals::pctrace_on = true;
     if(globals::pctrace_on && !(useronly && (uint32_t)s->pc >= 0x80000000u))
@@ -4079,7 +4108,8 @@ void execMips(state_t *s) {
 	    s->tlb[idx].entry_lo0 = s->cpr0_64[CPR0_ENTRYLO0];
 	    s->tlb[idx].entry_lo1 = s->cpr0_64[CPR0_ENTRYLO1];
 	    s->tlb[idx].page_mask = s->cpr0[CPR0_PAGEMASK];
-	    if(idx==0 && getenv("TLBTALLY")) { static uint64_t pv=~0ull; uint64_t c=s->tlb[0].entry_lo1;
+	    static const bool g_tlbtally = getenv("TLBTALLY") != nullptr;
+	    if(idx==0 && g_tlbtally) { static uint64_t pv=~0ull; uint64_t c=s->tlb[0].entry_lo1;
 	      if(c!=pv){ fprintf(stderr,"[iss-idx0-wr] hi=%llx lo0=%llx lo1=%llx v1=%d icnt=%lu\n",(unsigned long long)s->tlb[0].entry_hi,(unsigned long long)s->tlb[0].entry_lo0,(unsigned long long)c,(int)((c>>1)&1),(unsigned long)s->icnt); pv=c; } }
 	    assert(valid_page_mask(s->tlb[idx].page_mask));
 	    if(g_tlbpm_on) {
@@ -4145,7 +4175,8 @@ void execMips(state_t *s) {
 	  }
 	  if(!found) {
 	    s->cpr0[CPR0_INDEX] |= (1u << 31); /* P=1 (probe failed) */
-	    if(getenv("TLBP_ZERO_ON_MISS")) s->cpr0[CPR0_INDEX] = (1u << 31); /* mimic r9999: index=0 on TLBP miss */
+	    static const bool g_tlbp_zero = getenv("TLBP_ZERO_ON_MISS") != nullptr;
+	    if(g_tlbp_zero) s->cpr0[CPR0_INDEX] = (1u << 31); /* mimic r9999: index=0 on TLBP miss */
 	  }
 	  HISTO(s, mipsInsn::TLBP);
 	  break;

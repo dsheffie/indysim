@@ -11,6 +11,7 @@ namespace globals {
   extern uint64_t icountMIPS;
   extern uint64_t cycle;
   extern bool trace_retirement;
+  extern bool exec_dbg;   /* run execMips' DBG instance (debug knobs / retire trace / PCTRACE) */
   extern bool trace_fp;
   extern bool report_syscalls;
   /* PCTRACEOUT co-sim trace: when pctrace != null, each retired instruction
