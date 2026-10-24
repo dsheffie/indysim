@@ -5058,6 +5058,1164 @@ static void exec_itype(uint32_t inst, state_t *s) {
       }
 }
 
+/* ---- per-op handlers: each simple case body of exec_rtype / exec_itype, verbatim
+ * (break -> return).  Cases with a nested switch or loop stay in the class handler. */
+template <bool EL>
+static void op_r00(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	s->gpr[rd] = static_cast<int32_t>(s->gpr[rt]) << sa;
+	s->pc += 4;
+	if(inst == 0) {
+	  HISTO(s, mipsInsn::NOP);
+	}
+	else {
+	  HISTO(s, mipsInsn::SLL);
+	}
+	return;
+}
+
+template <bool EL>
+static void op_r01(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	_movci(inst,s);
+	return;
+}
+
+template <bool EL>
+static void op_r02(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	s->gpr[rd] = sext64(((uint32_t)s->gpr[rt] >> sa));
+	s->pc += 4;
+	HISTO(s, mipsInsn::SRL);
+	return;
+}
+
+template <bool EL>
+static void op_r03(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	s->gpr[rd] = static_cast<int32_t>(s->gpr[rt]) >> sa;
+	s->pc += 4;
+	HISTO(s, mipsInsn::SRA);
+	return;	
+}
+
+template <bool EL>
+static void op_r04(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	s->gpr[rd] = sext64(static_cast<uint32_t>(s->gpr[rt]) << (s->gpr[rs] & 0x1f));
+	s->pc += 4;
+	HISTO(s, mipsInsn::SLLV);
+	return;
+}
+
+template <bool EL>
+static void op_r06(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	s->gpr[rd] = sext64((uint32_t)s->gpr[rt] >> (s->gpr[rs] & 0x1f));
+	s->pc += 4;
+	HISTO(s, mipsInsn::SRLV);
+	return;
+}
+
+template <bool EL>
+static void op_r07(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	s->gpr[rd] = static_cast<int32_t>(s->gpr[rt]) >> (s->gpr[rs] & 0x1f);
+	s->pc += 4;
+	HISTO(s, mipsInsn::SRAV);
+	return;
+}
+
+template <bool EL>
+static void op_r08(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+{
+	state_t::reg_t jaddr = s->gpr[rs];
+	s->pc += 4;
+	if(!run_delay_slot<EL>(s))
+	  s->pc = jaddr;
+	HISTO(s, mipsInsn::JR);
+	return;
+      }
+}
+
+template <bool EL>
+static void op_r09(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+{
+	state_t::reg_t jaddr = s->gpr[rs];
+	if(rd != 0) {
+	  s->gpr[rd] = s->pc + 8;   /* full 64-bit link (n64 user PCs exceed 32 bits) */
+	}
+	s->pc += 4;
+	if(!run_delay_slot<EL>(s))
+	  s->pc = jaddr;
+	HISTO(s, mipsInsn::JALR);
+	return;
+      }
+}
+
+template <bool EL>
+static void op_r0c(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	raise_syscall(s);
+	HISTO(s, mipsInsn::BREAK);
+	return;
+}
+
+template <bool EL>
+static void op_r0d(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	raise_break(s);
+	HISTO(s, mipsInsn::BREAK);
+	return;
+}
+
+template <bool EL>
+static void op_r0f(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	s->pc += 4;
+	HISTO(s, mipsInsn::SYNC);
+	return;
+}
+
+template <bool EL>
+static void op_r10(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	s->gpr[rd] = s->hi;
+	s->pc += 4;
+	HISTO(s, mipsInsn::MFHI);
+	return;
+}
+
+template <bool EL>
+static void op_r11(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	s->hi = s->gpr[rs];
+	s->pc += 4;
+	HISTO(s, mipsInsn::MTHI);
+	return;
+}
+
+template <bool EL>
+static void op_r12(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	s->gpr[rd] = s->lo;
+	s->pc += 4;
+	HISTO(s, mipsInsn::MFLO);	
+	return;
+}
+
+template <bool EL>
+static void op_r13(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	s->lo = s->gpr[rs];
+	s->pc += 4;
+	HISTO(s, mipsInsn::MTLO);		
+	return;
+}
+
+template <bool EL>
+static void op_r18(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+{
+	int64_t y;
+	y = (int64_t)(int32_t)s->gpr[rs] * (int64_t)(int32_t)s->gpr[rt];
+	s->lo = (int32_t)(y & 0xffffffff);
+	s->hi = (int32_t)(y >> 32);
+	s->pc += 4;
+	HISTO(s, mipsInsn::MULT);			
+	return;
+      }
+}
+
+template <bool EL>
+static void op_r19(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+{
+	uint64_t y;
+	uint64_t u0 = (uint64_t)(uint32_t)s->gpr[rs];
+	uint64_t u1 = (uint64_t)(uint32_t)s->gpr[rt];
+	y = u0*u1;
+	s->lo = sext64((uint32_t)y);
+	s->hi = sext64((uint32_t)(y>>32));
+	s->pc += 4;
+	HISTO(s, mipsInsn::MULTU);
+	return;
+      }
+}
+
+template <bool EL>
+static void op_r1a(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	if((int32_t)s->gpr[rt] != 0) {
+	  int64_t a = (int32_t)s->gpr[rs], b = (int32_t)s->gpr[rt];
+	  s->lo = sext64((uint32_t)(int32_t)(a / b));
+	  s->hi = sext64((uint32_t)(int32_t)(a % b));
+	}
+	s->pc += 4;
+	HISTO(s, mipsInsn::DIV);
+	return;
+}
+
+template <bool EL>
+static void op_r1b(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	if(s->gpr[rt] != 0) {
+	  s->lo = sext64((uint32_t)s->gpr[rs] / (uint32_t)s->gpr[rt]);
+	  s->hi = sext64((uint32_t)s->gpr[rs] % (uint32_t)s->gpr[rt]);
+	}
+	s->pc += 4;
+	HISTO(s, mipsInsn::DIVU);
+	return;
+}
+
+template <bool EL>
+static void op_r1c(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+{
+	__int128 y = (__int128)s->gpr[rs] * (__int128)s->gpr[rt];
+	s->lo = (int64_t)(y & 0xffffffffffffffffULL);
+	s->hi = (int64_t)(y >> 64);
+	s->pc += 4;
+	HISTO(s, mipsInsn::DMULT);
+	return;
+      }
+}
+
+template <bool EL>
+static void op_r1d(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+{
+	unsigned __int128 y = (unsigned __int128)(uint64_t)s->gpr[rs]
+	                    * (unsigned __int128)(uint64_t)s->gpr[rt];
+	s->lo = (int64_t)(y & 0xffffffffffffffffULL);
+	s->hi = (int64_t)(uint64_t)(y >> 64);
+	s->pc += 4;
+	HISTO(s, mipsInsn::DMULTU);
+	return;
+      }
+}
+
+template <bool EL>
+static void op_r1e(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	if(s->gpr[rt] != 0) {
+	  s->lo = s->gpr[rs] / s->gpr[rt];
+	  s->hi = s->gpr[rs] % s->gpr[rt];
+	}
+	s->pc += 4;
+	HISTO(s, mipsInsn::DDIV);
+	return;
+}
+
+template <bool EL>
+static void op_r1f(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	if(s->gpr[rt] != 0) {
+	  s->lo = (int64_t)((uint64_t)s->gpr[rs] / (uint64_t)s->gpr[rt]);
+	  s->hi = (int64_t)((uint64_t)s->gpr[rs] % (uint64_t)s->gpr[rt]);
+	}
+	s->pc += 4;
+	HISTO(s, mipsInsn::DDIVU);
+	return;
+}
+
+template <bool EL>
+static void op_r20(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+{
+	uint32_t u_rs = (uint32_t)s->gpr[rs];
+	uint32_t u_rt = (uint32_t)s->gpr[rt];
+	uint32_t result = u_rs + u_rt;
+	/* Overflow iff same-sign inputs produce different-sign result.
+	 * Matches RTL: w_add32_overflow = (result[31]!=rt[31]) & (rs[31]==rt[31]) */
+	if (((result >> 31) != (u_rt >> 31)) && ((u_rs >> 31) == (u_rt >> 31))) {
+	  raise_overflow(s);
+	  return;
+	}
+	s->gpr[rd] = sext64(result);
+	s->pc += 4;
+	HISTO(s, mipsInsn::ADD);
+	return;
+      }
+}
+
+template <bool EL>
+static void op_r21(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+{
+	uint32_t u_rs = (uint32_t)s->gpr[rs];
+	uint32_t u_rt = (uint32_t)s->gpr[rt];
+	s->gpr[rd] = sext64(u_rs + u_rt);
+	s->pc += 4;
+	HISTO(s, mipsInsn::ADDU);
+	return;
+      }
+}
+
+template <bool EL>
+static void op_r22(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+{
+	uint32_t u_rs = (uint32_t)s->gpr[rs];
+	uint32_t u_rt = (uint32_t)s->gpr[rt];
+	uint32_t result = u_rs - u_rt;
+	/* A-B overflows iff operands differ in sign AND result sign != rs (minuend).
+	 * Matches RTL: w_sub32_overflow = (result[31]!=rs[31]) & (rs[31]!=rt[31]) */
+	if (((result >> 31) != (u_rs >> 31)) && ((u_rs >> 31) != (u_rt >> 31))) {
+	  raise_overflow(s);
+	  return;
+	}
+	s->gpr[rd] = sext64(result);
+	s->pc += 4;
+	HISTO(s, mipsInsn::SUB);
+	return;
+      }
+}
+
+template <bool EL>
+static void op_r23(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+{
+	uint32_t u_rs = (uint32_t)s->gpr[rs];
+	uint32_t u_rt = (uint32_t)s->gpr[rt];
+	uint32_t y = u_rs - u_rt;
+	s->gpr[rd] = sext64(y);
+	s->pc += 4;
+	HISTO(s, mipsInsn::SUBU);
+	return;
+      }
+}
+
+template <bool EL>
+static void op_r24(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	s->gpr[rd] = s->gpr[rs] & s->gpr[rt];
+	s->pc += 4;
+	HISTO(s, mipsInsn::AND);
+	return;
+}
+
+template <bool EL>
+static void op_r25(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	if(rd != 0) {
+	  s->gpr[rd] = s->gpr[rs] | s->gpr[rt];
+	}
+	s->pc += 4;
+	HISTO(s, mipsInsn::OR);
+	return;
+}
+
+template <bool EL>
+static void op_r26(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	s->gpr[rd] = s->gpr[rs] ^ s->gpr[rt];
+	s->pc += 4;
+	HISTO(s, mipsInsn::XOR);	
+	return;
+}
+
+template <bool EL>
+static void op_r27(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	s->gpr[rd] = ~(s->gpr[rs] | s->gpr[rt]);
+	s->pc += 4;
+	HISTO(s, mipsInsn::NOR);
+	return;
+}
+
+template <bool EL>
+static void op_r2a(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	s->gpr[rd] = s->gpr[rs] < s->gpr[rt];
+	s->pc += 4;
+	HISTO(s, mipsInsn::SLT);	
+	return;
+}
+
+template <bool EL>
+static void op_r2b(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+{
+	s->gpr[rd] = ((uint64_t)s->gpr[rs] < (uint64_t)s->gpr[rt]);
+	s->pc += 4;
+	HISTO(s, mipsInsn::SLTU);
+	return;
+      }
+}
+
+template <bool EL>
+static void op_r0b(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	s->gpr[rd] = (s->gpr[rt] != 0) ? s->gpr[rs] : s->gpr[rd];
+	s->pc +=4;
+	HISTO(s, mipsInsn::MOVN);
+	return;
+}
+
+template <bool EL>
+static void op_r0a(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	s->gpr[rd] = (s->gpr[rt] == 0) ? s->gpr[rs] : s->gpr[rd];
+	s->pc += 4;
+	HISTO(s, mipsInsn::MOVZ);	
+	return;
+}
+
+template <bool EL>
+static void op_r30(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	if((int64_t)s->gpr[rs] >= (int64_t)s->gpr[rt]) { raise_trap(s); return; }
+	s->pc += 4; HISTO(s, mipsInsn::TGE); return;
+}
+
+template <bool EL>
+static void op_r31(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	if((uint64_t)s->gpr[rs] >= (uint64_t)s->gpr[rt]) { raise_trap(s); return; }
+	s->pc += 4; HISTO(s, mipsInsn::TGEU); return;
+}
+
+template <bool EL>
+static void op_r32(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	if((int64_t)s->gpr[rs] < (int64_t)s->gpr[rt]) { raise_trap(s); return; }
+	s->pc += 4; HISTO(s, mipsInsn::TLT); return;
+}
+
+template <bool EL>
+static void op_r33(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	if((uint64_t)s->gpr[rs] < (uint64_t)s->gpr[rt]) { raise_trap(s); return; }
+	s->pc += 4; HISTO(s, mipsInsn::TLTU); return;
+}
+
+template <bool EL>
+static void op_r34(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	if(s->gpr[rs] == s->gpr[rt]) {
+	  raise_trap(s);
+	  return;
+	}
+	s->pc += 4;
+	HISTO(s, mipsInsn::TEQ);
+	return;
+}
+
+template <bool EL>
+static void op_r36(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	if(s->gpr[rs] != s->gpr[rt]) {
+	  raise_trap(s);
+	  return;
+	}
+	s->pc += 4;
+	HISTO(s, mipsInsn::TNE);
+	return;
+}
+
+template <bool EL>
+static void op_r2c(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+{
+	uint64_t u_rs = (uint64_t)s->gpr[rs];
+	uint64_t u_rt = (uint64_t)s->gpr[rt];
+	uint64_t result = u_rs + u_rt;
+	/* Matches RTL: w_add64_overflow = (result[63]!=rt[63]) & (rs[63]==rt[63]) */
+	if (((result >> 63) != (u_rt >> 63)) && ((u_rs >> 63) == (u_rt >> 63))) {
+	  raise_overflow(s);
+	  return;
+	}
+	s->gpr[rd] = (int64_t)result;
+	s->pc += 4;
+	HISTO(s, mipsInsn::DADD);
+	return;
+      }
+}
+
+template <bool EL>
+static void op_r2d(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	s->gpr[rd] = s->gpr[rs] + s->gpr[rt];
+	s->pc += 4;
+	HISTO(s, mipsInsn::DADDU);
+	return;
+}
+
+template <bool EL>
+static void op_r2e(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+{
+	uint64_t u_rs = (uint64_t)s->gpr[rs];
+	uint64_t u_rt = (uint64_t)s->gpr[rt];
+	uint64_t result = u_rs - u_rt;
+	/* A-B overflows iff operands differ in sign AND result sign != rs (minuend).
+	 * Matches RTL: w_sub64_overflow = (result[63]!=rs[63]) & (rs[63]!=rt[63]) */
+	if (((result >> 63) != (u_rs >> 63)) && ((u_rs >> 63) != (u_rt >> 63))) {
+	  raise_overflow(s);
+	  return;
+	}
+	s->gpr[rd] = (int64_t)result;
+	s->pc += 4;
+	HISTO(s, mipsInsn::DSUB);
+	return;
+      }
+}
+
+template <bool EL>
+static void op_r2f(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	s->gpr[rd] = s->gpr[rs] - s->gpr[rt];
+	s->pc += 4;
+	HISTO(s, mipsInsn::DSUBU);
+	return;
+}
+
+template <bool EL>
+static void op_r14(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	s->gpr[rd] = s->gpr[rt] << (s->gpr[rs] & 63);
+	s->pc += 4;
+	HISTO(s, mipsInsn::DSLLV);
+	return;
+}
+
+template <bool EL>
+static void op_r16(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	s->gpr[rd] = (int64_t)((uint64_t)s->gpr[rt] >> (s->gpr[rs] & 63));
+	s->pc += 4;
+	HISTO(s, mipsInsn::DSRLV);
+	return;
+}
+
+template <bool EL>
+static void op_r17(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	s->gpr[rd] = s->gpr[rt] >> (s->gpr[rs] & 63);
+	s->pc += 4;
+	HISTO(s, mipsInsn::DSRAV);
+	return;
+}
+
+template <bool EL>
+static void op_r38(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	s->gpr[rd] = s->gpr[rt] << sa;
+	s->pc += 4;
+	HISTO(s, mipsInsn::DSLL);
+	return;
+}
+
+template <bool EL>
+static void op_r3a(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	s->gpr[rd] = (int64_t)((uint64_t)s->gpr[rt] >> sa);
+	s->pc += 4;
+	HISTO(s, mipsInsn::DSRL);
+	return;
+}
+
+template <bool EL>
+static void op_r3b(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	s->gpr[rd] = s->gpr[rt] >> sa;
+	s->pc += 4;
+	HISTO(s, mipsInsn::DSRA);
+	return;
+}
+
+template <bool EL>
+static void op_r3c(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	s->gpr[rd] = s->gpr[rt] << (sa + 32);
+	s->pc += 4;
+	HISTO(s, mipsInsn::DSLL32);
+	return;
+}
+
+template <bool EL>
+static void op_r3e(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	s->gpr[rd] = (int64_t)((uint64_t)s->gpr[rt] >> (sa + 32));
+	s->pc += 4;
+	HISTO(s, mipsInsn::DSRL32);
+	return;
+}
+
+template <bool EL>
+static void op_r3f(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t funct = inst & 63; (void)funct;
+  uint32_t sa = (inst >> 6) & 31; (void)sa;
+	s->gpr[rd] = s->gpr[rt] >> (sa + 32);
+	s->pc += 4;
+	HISTO(s, mipsInsn::DSRA32);
+	return;
+}
+
+template <bool EL>
+static void op_i08(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t uimm32 = inst & ((1<<16) - 1); (void)uimm32;
+  int16_t simm16 = (int16_t)uimm32; (void)simm16;
+  int32_t simm32 = (int32_t)simm16; (void)simm32;
+  int32_t tmp = 0; (void)tmp;
+{
+	uint32_t u_rs  = (uint32_t)s->gpr[rs];
+	uint32_t u_imm = (uint32_t)simm32;
+	uint32_t result = u_rs + u_imm;
+	/* same rule as add (0x20): same-sign inputs, different-sign result */
+	if (((result >> 31) != (u_imm >> 31)) && ((u_rs >> 31) == (u_imm >> 31))) {
+	  raise_overflow(s);
+	  return;
+	}
+	s->gpr[rt] = sext64(result);
+	s->pc+=4;
+	HISTO(s, mipsInsn::ADDI);
+	return;
+      }
+}
+
+template <bool EL>
+static void op_i09(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t uimm32 = inst & ((1<<16) - 1); (void)uimm32;
+  int16_t simm16 = (int16_t)uimm32; (void)simm16;
+  int32_t simm32 = (int32_t)simm16; (void)simm32;
+  int32_t tmp = 0; (void)tmp;
+	tmp = sext64((uint32_t)(s->gpr[rs] + simm32));
+	s->gpr[rt] = tmp;
+	s->pc+=4;
+	HISTO(s, mipsInsn::ADDIU);
+	return;
+}
+
+template <bool EL>
+static void op_i0a(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t uimm32 = inst & ((1<<16) - 1); (void)uimm32;
+  int16_t simm16 = (int16_t)uimm32; (void)simm16;
+  int32_t simm32 = (int32_t)simm16; (void)simm32;
+  int32_t tmp = 0; (void)tmp;
+	s->gpr[rt] = (s->gpr[rs] < simm32);
+	s->pc += 4;
+	HISTO(s, mipsInsn::SLTI);
+	return;
+}
+
+template <bool EL>
+static void op_i0b(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t uimm32 = inst & ((1<<16) - 1); (void)uimm32;
+  int16_t simm16 = (int16_t)uimm32; (void)simm16;
+  int32_t simm32 = (int32_t)simm16; (void)simm32;
+  int32_t tmp = 0; (void)tmp;
+	s->gpr[rt] = ((uint64_t)s->gpr[rs] < (uint64_t)(int64_t)simm32);
+	s->pc += 4;
+	HISTO(s, mipsInsn::SLTIU);
+	return;
+}
+
+template <bool EL>
+static void op_i0c(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t uimm32 = inst & ((1<<16) - 1); (void)uimm32;
+  int16_t simm16 = (int16_t)uimm32; (void)simm16;
+  int32_t simm32 = (int32_t)simm16; (void)simm32;
+  int32_t tmp = 0; (void)tmp;
+	s->gpr[rt] = s->gpr[rs] & uimm32;
+	s->pc += 4;
+	HISTO(s, mipsInsn::ANDI);
+	return;
+}
+
+template <bool EL>
+static void op_i0d(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t uimm32 = inst & ((1<<16) - 1); (void)uimm32;
+  int16_t simm16 = (int16_t)uimm32; (void)simm16;
+  int32_t simm32 = (int32_t)simm16; (void)simm32;
+  int32_t tmp = 0; (void)tmp;
+	s->gpr[rt] = s->gpr[rs] | uimm32;
+	s->pc += 4;
+	HISTO(s, mipsInsn::ORI);
+	return;
+}
+
+template <bool EL>
+static void op_i0e(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t uimm32 = inst & ((1<<16) - 1); (void)uimm32;
+  int16_t simm16 = (int16_t)uimm32; (void)simm16;
+  int32_t simm32 = (int32_t)simm16; (void)simm32;
+  int32_t tmp = 0; (void)tmp;
+	s->gpr[rt] = s->gpr[rs] ^ uimm32;
+	s->pc += 4;
+	HISTO(s, mipsInsn::XORI);
+	return;
+}
+
+template <bool EL>
+static void op_i0f(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t uimm32 = inst & ((1<<16) - 1); (void)uimm32;
+  int16_t simm16 = (int16_t)uimm32; (void)simm16;
+  int32_t simm32 = (int32_t)simm16; (void)simm32;
+  int32_t tmp = 0; (void)tmp;
+	uimm32 <<= 16;
+	s->gpr[rt] = sext64(uimm32);
+	s->pc += 4;
+	HISTO(s, mipsInsn::LUI);
+	return;
+}
+
+template <bool EL>
+static void op_i18(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t uimm32 = inst & ((1<<16) - 1); (void)uimm32;
+  int16_t simm16 = (int16_t)uimm32; (void)simm16;
+  int32_t simm32 = (int32_t)simm16; (void)simm32;
+  int32_t tmp = 0; (void)tmp;
+{
+	uint64_t u_rs  = (uint64_t)s->gpr[rs];
+	uint64_t u_imm = (uint64_t)(int64_t)simm32;   /* sign-extend imm to 64 bits */
+	uint64_t result = u_rs + u_imm;
+	/* same overflow rule as dadd (0x2C): same-sign inputs, different-sign result */
+	if (((result >> 63) != (u_imm >> 63)) && ((u_rs >> 63) == (u_imm >> 63))) {
+	  raise_overflow(s);
+	  return;
+	}
+	s->gpr[rt] = (int64_t)result;
+	s->pc += 4;
+	HISTO(s, mipsInsn::DADDI);
+	return;
+      }
+}
+
+template <bool EL>
+static void op_i19(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t uimm32 = inst & ((1<<16) - 1); (void)uimm32;
+  int16_t simm16 = (int16_t)uimm32; (void)simm16;
+  int32_t simm32 = (int32_t)simm16; (void)simm32;
+  int32_t tmp = 0; (void)tmp;
+	s->gpr[rt] = s->gpr[rs] + simm32;
+	s->pc += 4;
+	HISTO(s, mipsInsn::DADDIU);
+	return;
+}
+
+template <bool EL>
+static void op_i27(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t uimm32 = inst & ((1<<16) - 1); (void)uimm32;
+  int16_t simm16 = (int16_t)uimm32; (void)simm16;
+  int32_t simm32 = (int32_t)simm16; (void)simm32;
+  int32_t tmp = 0; (void)tmp;
+{
+	uint32_t rs_ = (inst >> 21) & 31;
+	uint32_t rt_ = (inst >> 16) & 31;
+	int32_t imm  = (int32_t)(int16_t)(inst & 0xffffu);
+	uint32_t ea  = va_translate(s, s->gpr[rs_] + imm, tlb_op::load);
+	if(s->tlb_fault) return;
+	if(ea & 3) { raise_adel(s); return; }
+	s->gpr[rt_] = (uint64_t)(uint32_t)bswap<EL>(s->mem.get<int32_t>(ea));
+	s->pc += 4;
+	HISTO(s, mipsInsn::LWU);
+	return;
+      }
+}
+
+template <bool EL>
+static void op_i33(uint32_t inst, state_t *s) {
+  sparse_mem &mem = s->mem; (void)mem;
+  uint32_t opcode = inst>>26; (void)opcode;
+  uint32_t rs = (inst >> 21) & 31; (void)rs;
+  uint32_t rt = (inst >> 16) & 31; (void)rt;
+  uint32_t rd = (inst >> 11) & 31; (void)rd;
+  uint32_t uimm32 = inst & ((1<<16) - 1); (void)uimm32;
+  int16_t simm16 = (int16_t)uimm32; (void)simm16;
+  int32_t simm32 = (int32_t)simm16; (void)simm32;
+  int32_t tmp = 0; (void)tmp;
+	s->pc += 4;
+	return;
+}
+
 /* raw instruction word -> handler.  Every check exec_generic does before dispatch is a
  * static property of the word except its mode/CU1 test, so words that need one keep
  * going through exec_generic; the rest go straight to their class or op handler. */
@@ -5074,6 +6232,65 @@ static dinst_fn_t decode_insn(uint32_t inst) {
     return exec_generic<EL>;                       /* movci/movz/movn: MIPS IV RI */
   }
   if(op == 0) {
+    switch(fn)
+      {
+      case 0x00: return op_r00<EL>;
+      case 0x01: return op_r01<EL>;
+      case 0x02: return op_r02<EL>;
+      case 0x03: return op_r03<EL>;
+      case 0x04: return op_r04<EL>;
+      case 0x06: return op_r06<EL>;
+      case 0x07: return op_r07<EL>;
+      case 0x08: return op_r08<EL>;
+      case 0x09: return op_r09<EL>;
+      case 0x0a: return op_r0a<EL>;
+      case 0x0b: return op_r0b<EL>;
+      case 0x0c: return op_r0c<EL>;
+      case 0x0d: return op_r0d<EL>;
+      case 0x0f: return op_r0f<EL>;
+      case 0x10: return op_r10<EL>;
+      case 0x11: return op_r11<EL>;
+      case 0x12: return op_r12<EL>;
+      case 0x13: return op_r13<EL>;
+      case 0x14: return op_r14<EL>;
+      case 0x16: return op_r16<EL>;
+      case 0x17: return op_r17<EL>;
+      case 0x18: return op_r18<EL>;
+      case 0x19: return op_r19<EL>;
+      case 0x1a: return op_r1a<EL>;
+      case 0x1b: return op_r1b<EL>;
+      case 0x1c: return op_r1c<EL>;
+      case 0x1d: return op_r1d<EL>;
+      case 0x1e: return op_r1e<EL>;
+      case 0x1f: return op_r1f<EL>;
+      case 0x20: return op_r20<EL>;
+      case 0x21: return op_r21<EL>;
+      case 0x22: return op_r22<EL>;
+      case 0x23: return op_r23<EL>;
+      case 0x24: return op_r24<EL>;
+      case 0x25: return op_r25<EL>;
+      case 0x26: return op_r26<EL>;
+      case 0x27: return op_r27<EL>;
+      case 0x2a: return op_r2a<EL>;
+      case 0x2b: return op_r2b<EL>;
+      case 0x2c: return op_r2c<EL>;
+      case 0x2d: return op_r2d<EL>;
+      case 0x2e: return op_r2e<EL>;
+      case 0x2f: return op_r2f<EL>;
+      case 0x30: return op_r30<EL>;
+      case 0x31: return op_r31<EL>;
+      case 0x32: return op_r32<EL>;
+      case 0x33: return op_r33<EL>;
+      case 0x34: return op_r34<EL>;
+      case 0x36: return op_r36<EL>;
+      case 0x38: return op_r38<EL>;
+      case 0x3a: return op_r3a<EL>;
+      case 0x3b: return op_r3b<EL>;
+      case 0x3c: return op_r3c<EL>;
+      case 0x3e: return op_r3e<EL>;
+      case 0x3f: return op_r3f<EL>;
+      default: break;
+      }
     return exec_rtype<EL>;
   }
   if(op == 0x02 || op == 0x03) {
@@ -5116,6 +6333,18 @@ static dinst_fn_t decode_insn(uint32_t inst) {
   case 0x39: return _swc1<EL>;
   case 0x3d: return _sdc1<EL>;
   case 0x3f: return _sd<EL>;
+    case 0x08: return op_i08<EL>;
+    case 0x09: return op_i09<EL>;
+    case 0x0a: return op_i0a<EL>;
+    case 0x0b: return op_i0b<EL>;
+    case 0x0c: return op_i0c<EL>;
+    case 0x0d: return op_i0d<EL>;
+    case 0x0e: return op_i0e<EL>;
+    case 0x0f: return op_i0f<EL>;
+    case 0x18: return op_i18<EL>;
+    case 0x19: return op_i19<EL>;
+    case 0x27: return op_i27<EL>;
+    case 0x33: return op_i33<EL>;
     default: break;
     }
   return exec_itype<EL>;
