@@ -33,7 +33,7 @@
 <body>
   <header>
     <h1>indysim</h1>
-    <p>SGI Indy (IP22) · MIPS R4400 · WebAssembly</p>
+    <p>SGI Indy (IP22) · MIPS R4400 · WebAssembly · <span id="build"></span></p>
   </header>
 
   <div id="controls">
@@ -50,9 +50,12 @@
     <pre id="term"></pre>
   </div>
 
+<script src="build_id.js"></script>
 <script>
   const term = document.getElementById('term');
   const statusText = document.getElementById('statusText');
+  const buildEl = document.getElementById('build');
+  buildEl.textContent = 'build ' + (self.INDYSIM_BUILD || 'unknown');
   const screen = document.getElementById('screen');
   const canvas = document.getElementById('fb');
   const ctx = canvas.getContext('2d');
@@ -75,7 +78,13 @@
   const worker = new Worker('worker.js');
   worker.onmessage = (e) => {
     const m = e.data;
-    if (m.kind === 'serial') { append(m.text); statusText.textContent = 'running'; }
+    if (m.kind === 'build') {
+      const page = (self.INDYSIM_BUILD || '').split(' ')[0];
+      if (page && !m.hash.startsWith(page)) {
+        buildEl.textContent += ' (wasm ' + m.hash.slice(0, 7) + ': stale cache, hard-reload)';
+      }
+    }
+    else if (m.kind === 'serial') { append(m.text); statusText.textContent = 'running'; }
     else if (m.kind === 'diag') { append(m.text, 'diag'); }
     else if (m.kind === 'frame') {
       if (!imgData || imgData.width !== m.w || imgData.height !== m.h) {

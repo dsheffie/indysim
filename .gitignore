@@ -42,6 +42,7 @@ sf_wasm_obj/
 boost_shim/
 guest/
 interp_mips.js
+build_id.js
 interp_mips.wasm
 interp_mips.data
 

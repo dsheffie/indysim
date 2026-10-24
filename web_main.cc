@@ -96,6 +96,13 @@ EM_JS(void, web_post_stat, (double icnt), {
   if (typeof postMessage === 'function') { postMessage({ kind: 'stat', icnt: icnt }); }
 });
 
+/* C->JS: the git hash this wasm was built from (githash.cc), posted once at startup so
+ * the page can tell a stale cached module from the build it advertises. */
+extern const char *githash;
+EM_JS(void, web_post_build, (const char *hash), {
+  if (typeof postMessage === 'function') { postMessage({ kind: 'build', hash: UTF8ToString(hash) }); }
+});
+
 /* render one Newport frame every N ticks (~10 fps at ~25 MIPS / 500k-insn ticks) */
 static const int WEB_FRAME_EVERY = 5;
 
@@ -159,6 +166,7 @@ int main(int argc, char *argv[]) {
   std::string filename, start_pc, disk, prom, cpu = "r4400";
   uint64_t maxinsns = ~(0ULL);
   bool newport = false;
+  web_post_build(githash);
 
   for(int i = 1; i < argc; i++) {
     std::string a = argv[i];

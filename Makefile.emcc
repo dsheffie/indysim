@@ -100,7 +100,7 @@ DEP = $(OBJ:.o=.d)
 EXE = interp_mips.js
 
 .PHONY: all clean
-all: $(EXE)
+all: $(EXE) build_id.js
 
 $(EXE): $(OBJ) $(SF_LIB) $(CHD_WLIB)
 	$(CXX) $(CXXFLAGS) $(EMFLAGS) $(PRELOAD) $(OBJ) $(SF_LIB) $(CHD_WLIBS) -o $(EXE)
@@ -113,6 +113,10 @@ $(CHD_WLIB):
 
 $(ODIR)/chd_reader.o: chd_reader.cc | $(ODIR) $(BOOST_SHIM)
 	$(CXX) -MMD $(CXXFLAGS) -Ilibchdr/include -c $< -o $@
+
+# the build the page advertises (header); the wasm reports its own githash at boot
+build_id.js: .git/HEAD .git/index
+	echo "self.INDYSIM_BUILD = '$(shell git rev-parse --short HEAD) $(shell date -u +%Y-%m-%d)';" > $@
 
 githash.cc: .git/HEAD .git/index
 	echo "const char *githash = \"$(shell git rev-parse HEAD)\";" > $@
