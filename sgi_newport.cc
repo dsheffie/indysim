@@ -470,10 +470,11 @@ sgi_newport::sgi_newport(state_t *s) : s(s) {
   rb.global_mask = g_xl24 ? 0x00ffffffu : 0x000000ffu;
   for(int i = 0; i < 2; i++) {
     xmap[i].revision = g_xl24 ? 3 : 1;
-    /* CMAP revision: bits 7:4 are the monitor-ID sense, 0xa = the 1280x1024 monitor.
-     * XL24 used to report 0x02 (monitor 0), so the real IP24 PROM fell back to a
-     * 1024x768 setup that the fixed 1280x1024 framebuffer shows as a scrambled corner */
-    cmap[i].revision = g_xl24 ? 0xa2 : 0xa1;
+    /* CMAP revision byte, as the IP24 PROM and Linux newport_con decode it: bit 7 = 8-bit
+     * board, bits 6:4 = board revision, bits 2:0 = CMAP revision.  The PROM only trusts
+     * the 8/24-bit flag (and sets up 1280x1024) at board revision >= 2: MAME's XL24 0x02
+     * (rev 0) gave a 1024x768 setup, and 0xa2 (bit 7 set) made hinv say "Indy 8-bit" */
+    cmap[i].revision = g_xl24 ? 0x22 : 0xa1;
     cmap[i].pal = new uint32_t[0x10000]();
   }
   vc2.ram = new uint16_t[VC2_RAM_SIZE]();
