@@ -69,11 +69,19 @@ void sgi_scc::rx_poll() {
 
 void sgi_scc::tick(uint64_t dticks) {
   clk += dticks;
+  tick_due();
+}
+
+void sgi_scc::tick_due() {
   if(clk >= rx_poll_at) { rx_poll(); rx_poll_at = clk + 65536; }  /* ~every 64k ticks */
+  next_due = rx_poll_at;
   for(int ch = 0; ch < 2; ch++) {
     if(tx_busy[ch] && clk >= drain_at[ch]) {
       tx_busy[ch] = false;                   /* shift complete: buffer empty */
       tx_ip[ch]   = true;                     /* Tx-buffer-empty interrupt (edge) */
+    }
+    if(tx_busy[ch] && drain_at[ch] < next_due) {
+      next_due = drain_at[ch];
     }
   }
 }
@@ -134,6 +142,9 @@ void sgi_scc::write(uint32_t offs, uint8_t b) {
     tx_ip[ch]   = false;
     tx_busy[ch] = true;
     drain_at[ch] = clk + TX_DRAIN_TICKS;
+    if(drain_at[ch] < next_due) {
+      next_due = drain_at[ch];
+    }
     return;
   }
   /* control write: Z8530 two-step pointer */

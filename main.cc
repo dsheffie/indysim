@@ -11,6 +11,7 @@
 #include <boost/program_options.hpp>
 
 #include "interpret.hh"
+#include "interrupt.hh"
 #include "ws_profile.hh"
 #include "bbv.hh"
 #include "brtrace.hh"
@@ -76,7 +77,7 @@ template <bool DBG>
 static void lean_loop(state_t *s) {
   if(s->maxicnt == ~(0UL)) {
     while(not(s->brk)) {
-      maybe_take_interrupt(s);   /* CP0 Count/Compare timer + Int delivery (per step) */
+      maybe_take_interrupt_inline(s);   /* CP0 Count/Compare timer + Int delivery (per step) */
       if constexpr(DBG) {
         execMips(s);
       }
@@ -87,7 +88,7 @@ static void lean_loop(state_t *s) {
   }
   else {                         /* -m given: also stop at maxicnt */
     while(not(s->brk) and s->icnt < s->maxicnt) {
-      maybe_take_interrupt(s);
+      maybe_take_interrupt_inline(s);
       if constexpr(DBG) {
         execMips(s);
       }

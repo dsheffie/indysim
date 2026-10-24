@@ -18,6 +18,7 @@
 
 
 #include "interpret.hh"
+#include "interrupt.hh"
 #include "sgi_hpc.hh"
 #include "sgi_mc.hh"
 #include "sgi_newport.hh"
@@ -352,6 +353,7 @@ static inline void raise_common(state_t *s, uint32_t exccode) {
  * timing, so throttling tick() hangs the boot. TODO: once every device is
  * modeled, replace this poll with a device-sets-a-flag scheme (the "right way"). */
 static const uint64_t INT_POLL = getenv("INT_POLL") ? strtoull(getenv("INT_POLL"),0,0) : 64;
+const uint64_t g_int_poll_mask = INT_POLL - 1;   /* interrupt.hh's inline per-instruction path */
 
 /* env-gated TLB/timer tally (TLBTALLY=1): compare against the FPGA bad-istack trigger */
 static uint64_t g_ty_timer=0, g_ty_tlbmiss=0, g_ty_idle_tlbmiss=0, g_ty_timer_in_tlbmiss=0, g_ty_timer_idle=0, g_ty_pda_miss=0;
@@ -408,24 +410,12 @@ static void console_watch(state_t *s, char c) {
 static uint64_t g_fpe_traps = 0;   /* FP exceptions taken (cause 15), shown with PCSAMPLE */
 
 void maybe_take_interrupt(state_t *s) {
-  
-  if(s->scc) s->scc->tick(1);                          /* serial TX timing: keep exact */
-  if(__builtin_expect(s->icnt >= s->gfx_next_icnt, 0)) {
-    newport_retrace(s);                                /* Newport vertical retrace timer */
-  }
-  /* CP0 Count is architecturally visible and the kernel's delay/clock
-   * calibration reads it, so advance it (and latch the timer IP7) every
-   * instruction -- cheap, and keeps the timer cycle-accurate. */
-  s->cpr0[CPR0_COUNT] = (s->cpr0[CPR0_COUNT] + 1u) & 0xffffffffu;
-  if(s->cpr0[CPR0_COUNT] == s->cpr0[CPR0_COMPARE]) {
-    s->cpr0[CPR0_CAUSE] |= (1u << 15);                 /* IP[7] = timer */
-  }
+  maybe_take_interrupt_inline(s);
+}
 
-  /* Poll devices every INT_POLL instructions, OR immediately when a device just
-   * raised an interrupt (irq_poke). The SCSI completion is synchronous and the
-   * kernel needs IP2 delivered right after the command -- a throttled delay loses
-   * it and the wd93 driver hits its 60s timeout + bus reset. */
-  if(!s->irq_poke && (s->icnt & (INT_POLL - 1)) != 0) return;
+/* the device poll + Int delivery half of maybe_take_interrupt, every INT_POLL
+ * instructions or right after a device raised one (irq_poke) */
+void device_poll_and_deliver(state_t *s) {
   s->irq_poke = false;
 
   /* IOC2/INT2 local0 (WD33C93 SCSI etc.) -> CP0 Cause IP[2] (bit 10). Level-

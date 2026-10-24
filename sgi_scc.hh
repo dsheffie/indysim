@@ -43,6 +43,9 @@ class sgi_scc {
   uint64_t drain_at[2] = {0, 0};        /* tick at which the shifting char completes */
   bool     tx_ip[2]    = {false, false};/* Tx-buffer-empty int pending (set on completion) */
   uint64_t clk         = 0;             /* instruction-tick clock */
+  uint64_t next_due    = 0;             /* clk at which tick1 must run tick_due: the
+                                         * earlier of rx_poll_at and a busy drain_at */
+  void     tick_due();                  /* the work tick() does when something is due */
 
   /* RX (console input), ported from henry-the-wannabe-ip22-soc rtl/ioc.sv:
    * host stdin -> 8-deep chanA Rx FIFO; the chanA DATA read returns+pops the
@@ -59,6 +62,13 @@ public:
   uint8_t read(uint32_t offs);          /* offs within the 16-byte SCC window */
   void    write(uint32_t offs, uint8_t b);
   void    tick(uint64_t dticks);        /* advance TX timing by dticks instruction ticks */
+  /* tick(1) for the per-instruction path: one compare unless the stdin poll or a
+   * shifting character is due */
+  inline void tick1() {
+    if(__builtin_expect(++clk >= next_due, 0)) {
+      tick_due();
+    }
+  }
   bool    int_pending();                /* SCC INT line: TxIE & Tx-IP, or Rx char available */
 };
 
