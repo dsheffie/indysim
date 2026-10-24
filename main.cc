@@ -345,7 +345,11 @@ int main(int argc, char *argv[]) {
   bbv_log *bbv = bbv_interval ? new bbv_log(bbv_interval) : nullptr;
   brtrace_log *brt = brtrace_out.empty() ? nullptr : new brtrace_log(brtrace_out.c_str());
 
+#ifdef __LEAN_BUILD__
   static const bool lean = true;
+#else
+  static const bool lean = false;
+#endif
   
   if(lean) {
     while(true ) {

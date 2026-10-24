@@ -29,7 +29,7 @@ ifneq ($(SDL_LIBS),)
 endif
 
 DEP = $(OBJ:.o=.d)
-OPT = -O3 -g -fomit-frame-pointer -std=c++17
+OPT = -O3 -g -fomit-frame-pointer -std=c++17 -D__LEAN_BUILD__
 EXE = indysim
 
 # Berkeley SoftFloat-3 (git submodule ./softfloat) -- bit-exact IEEE-754 with an

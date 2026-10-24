@@ -382,29 +382,9 @@ static void console_watch(state_t *s, char c) {
 }
 
 static uint64_t g_fpe_traps = 0;   /* FP exceptions taken (cause 15), shown with PCSAMPLE */
+
 void maybe_take_interrupt(state_t *s) {
-  { static const unsigned long g_pcs = getenv("PCSAMPLE") ? strtoul(getenv("PCSAMPLE"),0,0) : 0;
-    if(g_pcs && (s->icnt % g_pcs) == 0)
-      fprintf(stderr, "[pcsample] icnt=%llu pc=%08x fpe=%llu\n", (unsigned long long)s->icnt, (uint32_t)s->pc,
-              (unsigned long long)g_fpe_traps); }
-  /* SASH_WATCH: one-shot dump of the environment the PROM hands sash -- the first
-   * fetch in sash's link region (0x10000000..), with Status/sp/ARCS args + the TLB. */
-  { static const bool g_sashw = getenv("SASH_WATCH") != nullptr;
-    static bool sashw_fired = false;
-    if(g_sashw && !sashw_fired && (uint32_t)s->pc >= 0x10000000u && (uint32_t)s->pc < 0x10100000u) {
-      sashw_fired = true;
-      fprintf(stderr, "[sashwatch] first sash fetch pc=%08x icnt=%llu Status=%08x sp=%08x ra=%08x "
-                      "a0=%08x a1=%08x a2=%08x a3=%08x\n",
-              (uint32_t)s->pc, (unsigned long long)s->icnt, s->cpr0[12], (uint32_t)s->gpr[29],
-              (uint32_t)s->gpr[31], (uint32_t)s->gpr[4], (uint32_t)s->gpr[5],
-              (uint32_t)s->gpr[6], (uint32_t)s->gpr[7]);
-      for(int i = 0; i < state_t::NUM_TLB_ENTRIES; i++) {
-        if(s->tlb[i].entry_hi == 0 && s->tlb[i].entry_lo0 == 0 && s->tlb[i].entry_lo1 == 0) { continue; }
-        fprintf(stderr, "[sashwatch] tlb[%2d] hi=%016llx lo0=%016llx lo1=%016llx pm=%08x\n", i,
-                (unsigned long long)s->tlb[i].entry_hi, (unsigned long long)s->tlb[i].entry_lo0,
-                (unsigned long long)s->tlb[i].entry_lo1, s->tlb[i].page_mask);
-      }
-    } }
+  
   if(s->scc) s->scc->tick(1);                          /* serial TX timing: keep exact */
   if(__builtin_expect(s->icnt >= s->gfx_next_icnt, 0)) {
     newport_retrace(s);                                /* Newport vertical retrace timer */
@@ -413,101 +393,8 @@ void maybe_take_interrupt(state_t *s) {
    * calibration reads it, so advance it (and latch the timer IP7) every
    * instruction -- cheap, and keeps the timer cycle-accurate. */
   s->cpr0[CPR0_COUNT] = (s->cpr0[CPR0_COUNT] + 1u) & 0xffffffffu;
-  if(s->cpr0[CPR0_COUNT] == s->cpr0[CPR0_COMPARE])
+  if(s->cpr0[CPR0_COUNT] == s->cpr0[CPR0_COMPARE]) {
     s->cpr0[CPR0_CAUSE] |= (1u << 15);                 /* IP[7] = timer */
-
-  /* SH_PROBE=<pc>: golden a3/a4/a0 at a /sbin/sh insn (compare vs the RTL fault:
-   * RTL faulted sw a4,24(a3) @0x0e033b58 with a3=0x0e0a6ee8. a3 same+store OK -> TLB bug;
-   * a3 different -> a3 register corruption in the RTL. */
-  { static const bool g_cp = getenv("CRASHPROBE") != nullptr;
-    if(g_cp && (uint32_t)s->pc == 0x0e6818b4u)   /* silicon crash store: sw s0,0(t1) */
-      fprintf(stderr,"[crash] pc=0e6818b4 t1(addr)=%08x a0=%08x Status.FR=%u Status=%08x icnt=%llu\n",
-        (uint32_t)s->gpr[9],(uint32_t)s->gpr[4],((s->cpr0[12]>>26)&1u),s->cpr0[12],(unsigned long long)s->icnt);
-    /* golden FP capacity-sizer operands: at add.d f5,f6,f4 (0e636964) */
-    if(g_cp && (uint32_t)s->pc == 0x0e636964u) {
-      double f4=*((double*)(s->cpr1+4)), f6=*((double*)(s->cpr1+6));
-      fprintf(stderr,"[capfp] add.d: f6(const)=%.17g f4=%.17g -> f6+f4=%.17g trunc=%d icnt=%llu\n",
-        f6, f4, f6+f4, (int)(f6+f4), (unsigned long long)s->icnt);
-    }
-    /* golden FP grow intermediates: after mul.d f5,f4,f30 (0e774174) */
-    if(g_cp && (uint32_t)s->pc == 0x0e77417cu) {
-      double f4=*((double*)(s->cpr1+4)), f5=*((double*)(s->cpr1+5));
-      double f30=*((double*)(s->cpr1+30)), f28=*((double*)(s->cpr1+28));
-      fprintf(stderr,"[fp] t1(gpr9)=%d oldcap(t0)=%u f4=%g f30(ratio)=%g f5=t1xf30=%g f28(floor)=%g icnt=%llu\n",
-        (int)(int32_t)s->gpr[9], (uint32_t)s->gpr[8], f4, f30, f5, f28, (unsigned long long)s->icnt);
-    }
-    /* golden reference at the array-insert grow-test (idx=a2, capacity=t0 both live) */
-    if(g_cp && (uint32_t)s->pc == 0x0e774158u) {
-      uint32_t idx=(uint32_t)s->gpr[6], cap=(uint32_t)s->gpr[8], s4=(uint32_t)s->gpr[20];
-      fprintf(stderr,"[ref] s4=%08x idx=%u cap=%u %s tbl=%08x icnt=%llu\n",
-        s4, idx, cap, (idx>cap?"OOB!":"ok"), (uint32_t)s->gpr[2], (unsigned long long)s->icnt);
-    }
-  }
-  { static const bool g_bp = getenv("BASE_PROBE") != nullptr;
-    if(g_bp && (uint32_t)s->pc == 0x0e7742b8u)
-      { fprintf(stderr,"[GROW] base(v0)=%08x cap(t0)=%u cap(s7)=%u s5=%08x s4=%08x icnt=%llu\n",(uint32_t)s->gpr[2],(uint32_t)s->gpr[8],(uint32_t)s->gpr[23],(uint32_t)s->gpr[21],(uint32_t)s->gpr[20],(unsigned long long)s->icnt); }
-    if(g_bp && (uint32_t)s->pc == 0x0e7742e0u)
-      { uint32_t idx=(uint32_t)s->gpr[6], cnt=(uint32_t)s->gpr[23]; fprintf(stderr,"[BASEPROBE] base=%08x idx=%u count(s7)=%u %s icnt=%llu\n",(uint32_t)s->gpr[2],idx,cnt, idx>=cnt?"OOB!":"ok",(unsigned long long)s->icnt); }
-  }
-  { static const char* shp = getenv("SH_PROBE");
-    static const uint32_t g_shp = shp ? (uint32_t)strtoul(shp,0,0) : 0;
-    if(g_shp && (uint32_t)s->pc == g_shp)
-      fprintf(stderr, "[SHPROBE] pc=%08x a0=%016llx a3=%016llx a4=%016llx sp=%016llx icnt=%llu\n",
-        (uint32_t)s->pc, (unsigned long long)s->gpr[4], (unsigned long long)s->gpr[7],
-        (unsigned long long)s->gpr[8], (unsigned long long)s->gpr[29], (unsigned long long)s->icnt); }
-
-  /* F1C_PROBE: the silicon crash instruction 0c007f1c = `lw r16,0xedc(r16)` (loads a global
-   * pointer from r16+0xedc). Print r16 + the load addr each time interp reaches it, to confirm
-   * interp sees the same r16=0x200000 and same 0x200edc load (paired with the fault-side probe). */
-  { static const bool g_f1c = getenv("F1C_PROBE") != nullptr;
-    if(g_f1c && (uint32_t)s->pc == 0x0c007f1cu)
-      fprintf(stderr, "[F1C] pc=0c007f1c r16=%08x loadaddr=%08x icnt=%llu\n",
-        (uint32_t)s->gpr[16], (uint32_t)((uint32_t)s->gpr[16]+0xedc), (unsigned long long)s->icnt); }
-
-  /* SHLOOP: golden trace of the /sbin/sh list-walk (0x0e005974..0x0e005998) that the RTL
-   * SIGSEGVs on -- e00597c `lw v1,0(v1)` faults with v1=0.  Logged BEFORE each loop pc, so
-   * at e00597c v1(gpr[3]) is the pointer about to be deref'd; interp never faults so v1!=0
-   * here.  Compare the a1(gpr[5]) sequence + v1 vs the RTL SHLOOP: same a1 + non-zero v1 =>
-   * RTL load returned 0 (data bug); a1 diverges / extra iteration => a1/a0 corruption. */
-  { static const bool g_shloop = getenv("SHLOOP") != nullptr;
-    uint32_t pc = (uint32_t)s->pc;
-    if(g_shloop && (pc==0x0e005974||pc==0x0e005978||pc==0x0e00597c||pc==0x0e00598c||pc==0x0e005990||pc==0x0e005998))
-      fprintf(stderr, "[shloop] pc=%08x v0=%08x v1=%08x a0=%08x a1=%08x icnt=%llu\n",
-        pc, (uint32_t)s->gpr[2], (uint32_t)s->gpr[3], (uint32_t)s->gpr[4], (uint32_t)s->gpr[5],
-        (unsigned long long)s->icnt);
-    // FIRST control-flow divergence loop @0x0e03ab50 (NULL-term array walk): s0=r16, v0=r2 (*s0), s1=r17.
-    if(g_shloop && (pc==0x0e03ab50||pc==0x0e03ab64||pc==0x0e03ab68))
-      fprintf(stderr, "[shdiv] pc=%08x s0=%08x v0=%08x s1=%08x a1=%08x icnt=%llu\n",
-        pc, (uint32_t)s->gpr[16], (uint32_t)s->gpr[2], (uint32_t)s->gpr[17], (uint32_t)s->gpr[5],
-        (unsigned long long)s->icnt); }
-
-  /* SHTRACE: dump every /sbin/sh (0x0e000000..0x0e100000) userspace PC, to diff the golden
-   * invocation's PC stream vs the RTL crashing invocation and find the FIRST divergence. */
-  { static const bool g_shtrace = getenv("SHTRACE") != nullptr;
-    uint32_t pc2 = (uint32_t)s->pc;
-    if(g_shtrace && pc2>=0x0e000000u && pc2<0x0e100000u)
-      fprintf(stderr, "[sht] %08x\n", pc2); }
-
-  static const bool g_tally = getenv("TLBTALLY") != nullptr;
-  if(g_tally) {
-    if((uint32_t)s->pc == 0x880196bcu) { g_ty_tlbmiss++;
-      uint32_t bv=(uint32_t)s->cpr0[CPR0_BADVADDR];
-      if(bv>=0xffffa000u && bv<0xffffc000u){ g_ty_pda_miss++; if(g_ty_pda_miss<=8) fprintf(stderr,"[tally] PDA-region TLB miss bv=%08x icnt=%lu\n",bv,(unsigned long)s->icnt); }
-      if(ty_idle_sp((uint32_t)s->gpr[29])) g_ty_idle_tlbmiss++; }
-    if((s->icnt & 0x3ffffff) == 0) {
-      fprintf(stderr, "[tally icnt=%lu] timer_irq=%lu tlbmiss=%lu idle_tlbmiss=%lu timer_in_tlbmiss=%lu timer_in_IDLE_tlbmiss=%lu pda_miss=%lu\n",
-        (unsigned long)s->icnt,(unsigned long)g_ty_timer,(unsigned long)g_ty_tlbmiss,(unsigned long)g_ty_idle_tlbmiss,(unsigned long)g_ty_timer_in_tlbmiss,(unsigned long)g_ty_timer_idle,(unsigned long)g_ty_pda_miss);
-      uint64_t pva=0xffffffffffffa020ULL; int pidx=-1; uint64_t phi=0,plo0=0,plo1=0;
-      for(int i=0;i<state_t::NUM_TLB_ENTRIES;i++){
-        uint64_t pm=s->tlb[i].page_mask&0x1ffe000ULL;
-        uint64_t vm=(~(uint64_t)(pm|0x1fffULL))&0x000000ffffffe000ULL;
-        uint64_t ehi=s->tlb[i].entry_hi;
-        if(((pva&vm)==(ehi&vm))&&(((pva>>62)&3)==((ehi>>62)&3))){ pidx=i; phi=ehi; plo0=s->tlb[i].entry_lo0; plo1=s->tlb[i].entry_lo1; break; }
-      }
-      fprintf(stderr,"[tlbprobe] PDA(0xffffa020) idx=%d Wired=%u => %s  hi=%016llx lo0=%016llx lo1=%016llx\n",
-        pidx,(unsigned)s->cpr0[CPR0_WIRED], (pidx>=0&&pidx<(int)s->cpr0[CPR0_WIRED])?"WIRED":(pidx>=0?"resident-NOT-wired":"ABSENT"),
-        (unsigned long long)phi,(unsigned long long)plo0,(unsigned long long)plo1);
-    }
   }
 
   /* Poll devices every INT_POLL instructions, OR immediately when a device just
@@ -534,21 +421,6 @@ void maybe_take_interrupt(state_t *s) {
   }
   uint32_t sr = s->cpr0[CPR0_SR], cause = s->cpr0[CPR0_CAUSE];
   if((sr & SR_IE) && !(sr & (SR_EXL | SR_ERL)) && (((cause & sr) & 0xff00u) != 0u)) {
-    if(g_tally) {
-      if((cause & sr) & (1u<<15)) g_ty_timer++;
-      if(ty_in_tlbmiss((uint32_t)s->pc)) { g_ty_timer_in_tlbmiss++;
-        if(ty_idle_sp((uint32_t)s->gpr[29])) { g_ty_timer_idle++;
-          fprintf(stderr, "[tally] *** TIMER-IN-IDLE-TLBMISS EPC=%08x sp=%08x icnt=%lu ***\n", (uint32_t)s->pc,(uint32_t)s->gpr[29],(unsigned long)s->icnt); } }
-    }
-    { static const bool g_ipprobe = getenv("IPPROBE") != nullptr;
-      if(g_ipprobe) {
-        uint32_t pc = (uint32_t)s->pc;
-        if(pc >= 0x880034fcu && pc <= 0x88003600u) {   /* sthread_launch region */
-          unsigned ip = (unsigned)(((cause & sr) >> 8) & 0xff);
-          fprintf(stderr, "[ipprobe] INT @pc=%08x  IP=%02x (b7=timer b2=INT2/SCSI b1=SW1 b0=SW0)  icnt=%lu\n",
-                  pc, ip, (unsigned long)s->icnt);
-        }
-      } }
     set_exc_pc(s);
     raise_common(s, 0u);                               /* ExcCode 0 = Int */
   }
