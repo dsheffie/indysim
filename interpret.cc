@@ -1422,7 +1422,7 @@ struct dfast_t {
   uint32_t ppage;
 };
 static const uint32_t DFAST_SZ = 256;
-static dfast_t g_dfast[2][DFAST_SZ];   /* [0] loads, [1] stores */
+static dfast_t g_dfast[3][DFAST_SZ];   /* [0] loads, [1] stores, [2] instruction fetch */
 static const bool g_dfast_on = [](){
   static const char *knobs[] = {"DEVMAP", "ECCFG", "HEAP_PROBE", "HTRACE", "IDXWR", "MODLOG",
                                 "MODLOG_FLOOR", "NVLOG", "TLBDBG", "WATCHC4", "WATCHVA_ADDR"};
@@ -1443,11 +1443,11 @@ static inline void dfast_flush() {
 }
 
 static inline uint32_t va_translate(state_t *s, uint64_t va, tlb_op op) {
-  if(op == tlb_op::fetch) {
-    return va_translate_slow(s, va, op);
+  if(op == tlb_op::fetch && g_uitlb_interval) {
+    return va_translate_slow(s, va, op);     /* UITLBSTATS models every fetch */
   }
   const uint64_t vpage = va >> 12;
-  dfast_t &e = g_dfast[op == tlb_op::store][vpage & (DFAST_SZ - 1)];
+  dfast_t &e = g_dfast[op == tlb_op::store ? 1 : (op == tlb_op::fetch ? 2 : 0)][vpage & (DFAST_SZ - 1)];
   const uint64_t ctx1 = dfast_ctx(s) + 1;
   if(__builtin_expect(e.vpage == vpage && e.ctx1 == ctx1, 1)) {
     return e.ppage | (uint32_t)(va & 0xfffULL);
