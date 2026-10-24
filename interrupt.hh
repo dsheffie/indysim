@@ -7,7 +7,8 @@
 #include "interpret.hh"
 #include "sgi_scc.hh"
 
-extern const uint64_t g_int_poll_mask;
+extern const uint64_t g_int_poll;
+extern uint64_t g_next_poll_icnt;
 void newport_retrace(state_t *s) __attribute__((noinline));
 void device_poll_and_deliver(state_t *s);
 
@@ -24,7 +25,11 @@ static inline void maybe_take_interrupt_inline(state_t *s) {
   if(s->cpr0[CPR0_COUNT] == s->cpr0[CPR0_COMPARE]) {
     s->cpr0[CPR0_CAUSE] |= (1u << 15);               /* IP[7] = timer */
   }
-  if(__builtin_expect(s->irq_poke || (s->icnt & g_int_poll_mask) == 0, 0)) {
+  /* icnt can advance by 2 per step (a branch and its delay slot retire together), so test
+   * "passed the next poll point", never "icnt % INT_POLL == 0": a b/nop idle loop entered on
+   * an odd icnt would otherwise never poll -- no Int delivery at all, the machine spins */
+  if(__builtin_expect(s->irq_poke || s->icnt >= g_next_poll_icnt, 0)) {
+    g_next_poll_icnt = s->icnt + g_int_poll;
     device_poll_and_deliver(s);
   }
 }

@@ -355,7 +355,8 @@ static inline void raise_common(state_t *s, uint32_t exccode) {
  * timing, so throttling tick() hangs the boot. TODO: once every device is
  * modeled, replace this poll with a device-sets-a-flag scheme (the "right way"). */
 static const uint64_t INT_POLL = getenv("INT_POLL") ? strtoull(getenv("INT_POLL"),0,0) : 64;
-const uint64_t g_int_poll_mask = INT_POLL - 1;   /* interrupt.hh's inline per-instruction path */
+const uint64_t g_int_poll = INT_POLL;   /* interrupt.hh's inline per-instruction path */
+uint64_t g_next_poll_icnt = 0;
 
 /* env-gated TLB/timer tally (TLBTALLY=1): compare against the FPGA bad-istack trigger */
 static uint64_t g_ty_timer=0, g_ty_tlbmiss=0, g_ty_idle_tlbmiss=0, g_ty_timer_in_tlbmiss=0, g_ty_timer_idle=0, g_ty_pda_miss=0;
