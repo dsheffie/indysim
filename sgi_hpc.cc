@@ -252,7 +252,7 @@ void sgi_hpc::enet_run_dma(int ch) {
       static uint32_t s_frame_len = 0, s_ip_want = 0;
       if(s_frame_len == 0 && cnt >= 18) {               /* frame start: Ethernet + IP header */
         /* per-byte: pbuf..pbuf+17 may straddle a page in the paged wasm backing */
-        auto hb = [&](uint32_t k) -> uint8_t { return *s->mem.get_raw_ptr(pbuf + k); };
+        auto hb = [&](uint32_t k) -> uint8_t { return *s->mem.peek_raw_ptr(pbuf + k); };
         s_ip_want = (hb(12) == 0x08 && hb(13) == 0x00) ? 14u + (((uint32_t)hb(16) << 8) | hb(17)) : 0;
       }
       s_frame_len += cnt;

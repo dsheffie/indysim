@@ -577,6 +577,9 @@ int main(int argc, char *argv[]) {
     delete bbv;
   }
   std::cout << "\n" << s->icnt << " instructions executed, brk=" << (int)s->brk << "\n";
+  if(getenv("PREDECODE_STATS")) {
+    report_decode_cache();
+  }
   std::cout << (static_cast<double>(s->icnt) / t0)*1e-6 << " minsns/sec\n";
 
   

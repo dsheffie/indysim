@@ -350,6 +350,7 @@ static inline uint32_t get_branch_target(uint32_t pc, uint32_t inst) {
 void initState(state_t *s);
 void tlbpm_report();   /* TLBPMSTATS: tlbwi/tlbwr page-size histogram (SIGUSR1) */
 void execMips(state_t *s);
+void report_decode_cache();         /* predecode: decoded pages + write wipes (stderr) */
 void execMipsFast(state_t *s);      /* the DBG=false instance: no per-instruction debug hooks */
 bool exec_debug_requested();        /* any of execMips' per-instruction debug knobs set? */
 

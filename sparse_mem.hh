@@ -33,6 +33,10 @@ extern uint32_t g_watch_ldpc;    /* load-PC whose effective address to print (0 
  * WATCHLDPC): get/set take the out-of-line *_hooked path only when set.  Recompute with
  * sparse_mem_update_hooks() after changing any of them. */
 extern bool g_mem_hooks;
+/* decoded-instruction cache (interpret.cc): nonzero = this 4 KB physical page (post
+ * MC alias) holds decoded instructions; any write to it must call code_page_written */
+extern uint8_t g_code_page[1u << 20];
+void code_page_written(uint32_t ppn);
 void sparse_mem_update_hooks();
 extern uint64_t g_watch_lo, g_watch_hi;   /* icnt window [lo,hi) */
 extern uint64_t g_cur_pc, g_cur_icnt;     /* current insn context */
@@ -137,10 +141,25 @@ public:
   static inline uint64_t mc_alias(uint64_t pa) {
     return (pa < 0x00080000UL) ? (pa + 0x08000000UL) : pa;
   }
+  /* raw host pointer for DMA and other non-CPU accessors.  Callers may write through it,
+   * so a decoded code page is invalidated conservatively; read-only users that are hot
+   * (or must not disturb the decode cache) use peek_raw_ptr. */
   uint8_t *get_raw_ptr(uint64_t byte_addr) {
     byte_addr &= ((1ULL<<32) - 1);   /* 1ULL: 1UL<<32 is undefined on 32-bit targets */
     if(route_devices) byte_addr = mc_alias(byte_addr);
+    code_write_check(byte_addr);
     return backing(byte_addr);
+  }
+  uint8_t *peek_raw_ptr(uint64_t byte_addr) {
+    byte_addr &= ((1ULL<<32) - 1);
+    if(route_devices) byte_addr = mc_alias(byte_addr);
+    return backing(byte_addr);
+  }
+  static inline void code_write_check(uint64_t aliased_pa) {
+    const uint32_t ppn = (uint32_t)(aliased_pa >> 12) & 0xfffffu;
+    if(unlikely(g_code_page[ppn])) {
+      code_page_written(ppn);
+    }
   }
   template <typename T>
   T get(uint64_t byte_addr) {
@@ -206,6 +225,7 @@ public:
       set_hooked<T>(byte_addr, v);
       return;
     }
+    code_write_check(route_devices ? mc_alias((uint32_t)byte_addr) : (uint32_t)byte_addr);
     if(route_devices) {
       if((byte_addr >> 24) == 0x1f) {
         route_store<T>(byte_addr, v);
@@ -228,6 +248,7 @@ public:
       fprintf(stderr, "[wr] icnt=%lu pc=%08x pa=%08x val=%016llx sz=%zu\n",
               (unsigned long)g_cur_icnt, (uint32_t)g_cur_pc, (uint32_t)byte_addr,
               (unsigned long long)(uint64_t)v, sizeof(T));
+    code_write_check(route_devices ? mc_alias((uint32_t)byte_addr) : (uint32_t)byte_addr);
     if(route_devices) {
       if(byte_addr>=0x1f000000 && byte_addr<=0x1fffffff) { route_store<T>(byte_addr, v); return; }
       byte_addr = mc_alias(byte_addr);

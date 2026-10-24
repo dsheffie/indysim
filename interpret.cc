@@ -601,7 +601,7 @@ bool gdb_mem_read(state_t *s, uint64_t va, uint8_t *buf, uint32_t len) {
   for(uint32_t i = 0; i < len; i++) {
     uint32_t pa;
     if(!tlb_probe_ro(s, va + i, &pa)) return false;
-    buf[i] = *s->mem.get_raw_ptr(pa);
+    buf[i] = *s->mem.peek_raw_ptr(pa);
   }
   return true;
 }
@@ -2333,12 +2333,12 @@ static inline char* get_open_string(sparse_mem &mem, uint32_t offset) {
   /* read byte-by-byte: the string may span pages, and the wasm backing is paged
    * so a single get_raw_ptr is only valid within one 4 KiB page. */
   size_t len = 0;
-  while(*mem.get_raw_ptr(offset + len) != '\0') {
+  while(*mem.peek_raw_ptr(offset + len) != '\0') {
     len++;
   }
   char *buf = new char[len+1];
   for(size_t i = 0; i < len; i++) {
-    buf[i] = (char)*mem.get_raw_ptr(offset + i);
+    buf[i] = (char)*mem.peek_raw_ptr(offset + i);
   }
   buf[len] = '\0';
   return buf;
@@ -3321,12 +3321,40 @@ static dinst_t *g_dpages[1u << 20];   /* by 4 KB physical page number (32-bit PA
 static dinst_t *g_fc_dpage = nullptr; /* decoded page for the fetch cache's page */
 static uint8_t *g_fc_host = nullptr;   /* host bytes of that page, or null: fetch via mem.get */
 
+uint8_t g_code_page[1u << 20];          /* see sparse_mem.hh: page has decoded slots */
+static uint64_t g_code_wipes = 0;        /* pages wiped by a write (reported at exit) */
+
+/* decoded pages are keyed like the write checks: the MC-aliased physical page */
+static inline uint32_t dpage_key(uint32_t pa) {
+  return (uint32_t)(sparse_mem::mc_alias(pa) >> 12) & 0xfffffu;
+}
+
 static dinst_t *dpage_for(uint32_t pa) {
-  dinst_t *&d = g_dpages[pa >> 12];
+  dinst_t *&d = g_dpages[dpage_key(pa)];
   if(d == nullptr) {
     d = new dinst_t[DPAGE_SLOTS]();
   }
   return d;
+}
+
+/* a write hit a page holding decoded instructions: forget them (the page stays
+ * allocated, so the fetch cache's pointer stays valid; the next fetch re-decodes) */
+void code_page_written(uint32_t ppn) {
+  dinst_t *d = g_dpages[ppn];
+  if(d != nullptr) {
+    memset(d, 0, DPAGE_SLOTS * sizeof(dinst_t));
+  }
+  g_code_page[ppn] = 0;
+  g_code_wipes++;
+}
+
+void report_decode_cache() {
+  uint64_t pages = 0;
+  for(uint32_t i = 0; i < (1u << 20); i++) {
+    pages += (g_dpages[i] != nullptr);
+  }
+  fprintf(stderr, "[predecode] %llu decoded pages, %llu wiped by writes\n",
+          (unsigned long long)pages, (unsigned long long)g_code_wipes);
 }
 
 /* Everything after fetch: the dynamic checks (64-bit gating, MIPS IV RI, CU1) and the
@@ -5120,10 +5148,19 @@ void execMips(state_t *s) {
     /* RAM and PROM pages are plain memory: fetch straight from the host page.  The MC/
      * HPC register windows (0x1f000000..0x1fbfffff) and the memory hooks keep mem.get. */
     const bool via_get = g_mem_hooks || ((ipa >> 24) == 0x1f && ipa < 0x1fc00000u);
-    g_fc_host = via_get ? nullptr : s->mem.get_raw_ptr(ipa & ~0xfffu);
+    g_fc_host = via_get ? nullptr : s->mem.peek_raw_ptr(ipa & ~0xfffu);
   }
-  uint32_t inst = bswap<EL>(g_fc_host ? *reinterpret_cast<uint32_t *>(g_fc_host + (ipa & 0xfffu))
-                                      : mem.get<uint32_t>(ipa));
+  /* decoded-instruction cache (Bedichek, "decode once, execute many"): slots are
+   * cleared when their physical page is written (code_page_written), so a filled
+   * slot is current and the raw word is only read to fill an empty one */
+  dinst_t *di = &g_fc_dpage[(ipa >> 2) & (DPAGE_SLOTS - 1)];
+  if(di->fn == nullptr) {
+    di->inst = bswap<EL>(g_fc_host ? *reinterpret_cast<uint32_t *>(g_fc_host + (ipa & 0xfffu))
+                                   : mem.get<uint32_t>(ipa));
+    di->fn = decode_insn<EL>(di->inst);
+    g_code_page[dpage_key(ipa)] = 1;
+  }
+  const uint32_t inst = di->inst;
   if constexpr(DBG) { static const bool g_dis = getenv("DISPROBE") != nullptr;
     static uint32_t seen[128]; static int nseen=0;
     uint32_t pc32=(uint32_t)s->pc;
@@ -5449,12 +5486,5 @@ void execMips(state_t *s) {
  
   
   
-  /* decoded-instruction cache (Bedichek, "decode once, execute many"): the slot for
-   * this physical word holds the handler; re-decoded whenever the word changed */
-  dinst_t *di = &g_fc_dpage[(ipa >> 2) & (DPAGE_SLOTS - 1)];
-  if(di->fn == nullptr || di->inst != inst) {
-    di->inst = inst;
-    di->fn = decode_insn<EL>(inst);
-  }
   di->fn(inst, s);
 }
