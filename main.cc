@@ -55,6 +55,53 @@ static void on_sigusr1(int) { g_sig_dumpproc   = 1; g_sig_any = 1; }
 static void on_sigusr2(int) { g_sig_flushdelta = 1; g_sig_any = 1; }
 static void on_sigurg(int)    { g_sig_trace_on  = 1; g_sig_any = 1; }
 static void on_sigvtalrm(int) { g_sig_trace_off = 1; g_sig_any = 1; }
+
+/* PCRING=<log2 entries>: the lean loop records every instruction's {ASID, PC} in a
+ * ring, and SIGUSR1 writes it oldest-first to pcring.<n>.bin (uint64 LE, asid<<32|pc)
+ * alongside the process dump.  For hangs: the last thing each process ran before it
+ * went to sleep, without a full retire trace. */
+static uint64_t *g_pcring = nullptr;
+static uint64_t g_pcring_mask = 0, g_pcring_pos = 0;
+static int g_pcring_dumps = 0;
+
+static void pcring_dump() {
+  if(g_pcring == nullptr) {
+    return;
+  }
+  const std::string out = "pcring." + std::to_string(g_pcring_dumps++) + ".bin";
+  FILE *fp = fopen(out.c_str(), "wb");
+  if(fp == nullptr) {
+    perror(out.c_str());
+    return;
+  }
+  const uint64_t n = (g_pcring_pos > g_pcring_mask) ? (g_pcring_mask + 1) : g_pcring_pos;
+  for(uint64_t i = g_pcring_pos - n; i != g_pcring_pos; i++) {
+    fwrite(&g_pcring[i & g_pcring_mask], sizeof(uint64_t), 1, fp);
+  }
+  fclose(fp);
+  fprintf(stderr, "[pcring] wrote %llu entries to %s\n", (unsigned long long)n, out.c_str());
+}
+
+/* the lean loop's share of the signal work (the full loop does its own below) */
+static void service_lean_signals(state_t *s) {
+  g_sig_any = 0;
+  if(g_sig_dumpproc) {
+    g_sig_dumpproc = 0;
+    dump_current_process(s);
+    tlbpm_report();
+    pcring_dump();
+  }
+  if(g_sig_flushdelta) {
+    g_sig_flushdelta = 0;
+    if(s->scsi) {
+      s->scsi->flush_delta();
+    }
+  }
+  if(g_sig_trace_on || g_sig_trace_off) {
+    g_sig_trace_on = g_sig_trace_off = 0;
+    fprintf(stderr, "[retiretrace] signals need a non-lean build\n");
+  }
+}
 namespace globals {
   bool enClockFuncts = false;
   uint64_t icountMIPS = 0;
@@ -72,29 +119,44 @@ namespace globals {
 };
 static state_t *s = nullptr;
 
-/* the lean main loop; DBG picks execMips' instance once, outside the loop */
-template <bool DBG>
+/* one lean-loop instruction.  DBG picks execMips' instance (and services gdb), RING
+ * records {ASID, PC}; both are fixed per loop instance.  Signals are checked every
+ * 64K steps on a local countdown (icnt can step by 2, so no icnt modulo). */
+template <bool DBG, bool RING>
+static inline void lean_step(state_t *s, uint32_t &sigpoll) {
+  maybe_take_interrupt_inline(s);   /* CP0 Count/Compare timer + Int delivery (per step) */
+  if constexpr(RING) {
+    g_pcring[g_pcring_pos++ & g_pcring_mask] = ((uint64_t)(s->cpr0[CPR0_ENTRYHI] & 0xff) << 32) | (uint32_t)s->pc;
+  }
+  if constexpr(DBG) {
+    if(s->gdb) {
+      s->gdb->step_hook(s);         /* gdb RSP: breakpoints / attach / step */
+    }
+    execMips(s);
+  }
+  else {
+    execMipsFast(s);
+  }
+  if(__builtin_expect(--sigpoll == 0, 0)) {
+    sigpoll = 1u << 16;
+    if(g_sig_any) {
+      service_lean_signals(s);
+    }
+  }
+}
+
+/* the lean main loop; DBG/RING pick the step's instance once, outside the loop */
+template <bool DBG, bool RING>
 static void lean_loop(state_t *s) {
+  uint32_t sigpoll = 1u << 16;
   if(s->maxicnt == ~(0UL)) {
     while(not(s->brk)) {
-      maybe_take_interrupt_inline(s);   /* CP0 Count/Compare timer + Int delivery (per step) */
-      if constexpr(DBG) {
-        execMips(s);
-      }
-      else {
-        execMipsFast(s);
-      }
+      lean_step<DBG, RING>(s, sigpoll);
     }
   }
   else {                         /* -m given: also stop at maxicnt */
     while(not(s->brk) and s->icnt < s->maxicnt) {
-      maybe_take_interrupt_inline(s);
-      if constexpr(DBG) {
-        execMips(s);
-      }
-      else {
-        execMipsFast(s);
-      }
+      lean_step<DBG, RING>(s, sigpoll);
     }
   }
 }
@@ -381,13 +443,31 @@ int main(int argc, char *argv[]) {
   static const bool lean = false;
 #endif
   
-  globals::exec_dbg = exec_debug_requested() or not(retire_name.empty()) or (globals::pctrace != nullptr);
+  /* --gdb needs the DBG instance: the lean fast path does not service the stub */
+  globals::exec_dbg = exec_debug_requested() or not(retire_name.empty()) or (globals::pctrace != nullptr) or (gdb_port != 0);
+  if(const char *pr = getenv("PCRING")) {
+    const int lg = atoi(pr);
+    g_pcring_mask = (1ULL << lg) - 1;
+    g_pcring = new uint64_t[g_pcring_mask + 1]();
+    fprintf(stderr, "[pcring] %llu entries; kill -USR1 %d to write pcring.<n>.bin\n",
+            (unsigned long long)(g_pcring_mask + 1), (int)getpid());
+  }
   if(lean) {
     if(globals::exec_dbg) {
-      lean_loop<true>(s);
+      if(g_pcring) {
+        lean_loop<true, true>(s);
+      }
+      else {
+        lean_loop<true, false>(s);
+      }
     }
     else {
-      lean_loop<false>(s);
+      if(g_pcring) {
+        lean_loop<false, true>(s);
+      }
+      else {
+        lean_loop<false, false>(s);
+      }
     }
   }
 
