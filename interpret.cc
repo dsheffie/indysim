@@ -4064,6 +4064,12 @@ static void exec_generic(uint32_t inst, state_t *s) {
 	     * then dropped per the R4400 spec (cp0_write_mask). */
 	    { uint64_t v = (rd == CPR0_ENTRYHI) ? s->gpr[rt]
 	                                        : (uint64_t)(int64_t)(int32_t)s->gpr[rt];
+	      if(rd == CPR0_CONFIG) {
+	        /* R4400: only K0 [2:0] and CU [3] are writable; IC/DC/IB/DB/SC/... are fixed
+	         * by the part.  Taking the whole word let a PROM/kernel mtc0 clear SC, so
+	         * IRIX sized a secondary cache the configured CPU does not have. */
+	        v = (s->cpr0_64[CPR0_CONFIG] & ~0xfULL) | (v & 0xfULL);
+	      }
 	      s->cpr0_64[rd] = cp0_write_mask(rd, v); }
 	    s->cpr0[rd] = (uint32_t)s->cpr0_64[rd];
 	    if(rd == CPR0_SR || rd == CPR0_ENTRYHI) {
