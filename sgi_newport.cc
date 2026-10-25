@@ -473,8 +473,10 @@ sgi_newport::sgi_newport(state_t *s) : s(s) {
     /* CMAP revision byte, as the IP24 PROM and Linux newport_con decode it: bit 7 = 8-bit
      * board, bits 6:4 = board revision, bits 2:0 = CMAP revision.  The PROM only trusts
      * the 8/24-bit flag (and sets up 1280x1024) at board revision >= 2: MAME's XL24 0x02
-     * (rev 0) gave a 1024x768 setup, and 0xa2 (bit 7 set) made hinv say "Indy 8-bit" */
-    cmap[i].revision = g_xl24 ? 0x22 : 0xa1;
+     * (rev 0) gave a 1024x768 setup, and 0xa2 (bit 7 set) made hinv say "Indy 8-bit".
+     * CMAP1's upper nibble is the monitor-ID sense instead (0xa = 1280x1024), as IRIS
+     * and the PROM's second read (DCB slave 3) have it. */
+    cmap[i].revision = g_xl24 ? (i == 0 ? 0x22 : 0xa2) : 0xa1;
     cmap[i].pal = new uint32_t[0x10000]();
   }
   vc2.ram = new uint16_t[VC2_RAM_SIZE]();
