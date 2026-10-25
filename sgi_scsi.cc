@@ -199,6 +199,18 @@ void sgi_scsi::finish() {
     size_t blocks = buf.size() / 512;
     for(size_t i = 0; i < blocks; i++)
       block_write(wr_lba + i, buf.data() + i * 512);
+    { /* SCSIWDUMP=<file>: append every written block as {uint64 lba (LE), 512 bytes},
+       * the same format as the board driver's, to diff guest writes block by block */
+      static FILE *g_wd = getenv("SCSIWDUMP") ? fopen(getenv("SCSIWDUMP"), "wb") : nullptr;
+      if(g_wd) {
+        for(size_t i = 0; i < blocks; i++) {
+          uint64_t l = wr_lba + i;
+          fwrite(&l, 8, 1, g_wd);
+          fwrite(buf.data() + i * 512, 512, 1, g_wd);
+        }
+        fflush(g_wd);
+      }
+    }
     if(getenv("SCSIHASH")) {                 /* golden per-WRITE payload hash (vs FPGA) */
       uint64_t h = 1469598103934665603ULL;
       for(size_t i = 0; i < buf.size(); i++) { h ^= buf[i]; h *= 1099511628211ULL; }
