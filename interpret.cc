@@ -1566,12 +1566,24 @@ struct c1xExec {
 };
 
 
+static inline uint32_t *fpr_hw(state_t *s, uint32_t r);
+static inline uint32_t fpr_dreg(const state_t *s, uint32_t r);
+
+/* lwxc1/ldxc1 and swxc1/sdxc1 use the same FR=0/FR=1 register mapping as
+ * lwc1/ldc1/swc1/sdc1: a word access goes through fpr_hw (FR=0 odd = high half
+ * of the even reg), a doubleword through fpr_dreg (FR=0 forces even). */
 template <bool EL, typename T>
 void lxc1(uint32_t inst, state_t *s) {
   mips_t mi(inst);
   uint32_t ea = va_translate(s, s->gpr[mi.lc1x.base] + s->gpr[mi.lc1x.index], tlb_op::load);
   if(s->tlb_fault) return;
-  *reinterpret_cast<T*>(s->cpr1 + mi.lc1x.fd) = bswap<EL>(s->mem.get<T>(ea));
+  T v = bswap<EL>(s->mem.get<T>(ea));
+  if(sizeof(T) == 4) {
+    *reinterpret_cast<T*>(fpr_hw(s, mi.lc1x.fd)) = v;
+  }
+  else {
+    *reinterpret_cast<T*>(s->cpr1 + fpr_dreg(s, mi.lc1x.fd)) = v;
+  }
   s->pc += 4;
 }
 
@@ -1581,7 +1593,14 @@ void sxc1(uint32_t inst, state_t *s) {
   mips_t mi(inst);
   uint32_t ea = va_translate(s, s->gpr[mi.lc1x.base] + s->gpr[mi.lc1x.index], tlb_op::store);
   if(s->tlb_fault) return;
-  s->mem.set<T>(ea, bswap<EL>(*reinterpret_cast<T*>(s->cpr1 + mi.lc1x.pad)));
+  T v;
+  if(sizeof(T) == 4) {
+    v = *reinterpret_cast<T*>(fpr_hw(s, mi.lc1x.pad));
+  }
+  else {
+    v = *reinterpret_cast<T*>(s->cpr1 + fpr_dreg(s, mi.lc1x.pad));
+  }
+  s->mem.set<T>(ea, bswap<EL>(v));
   s->pc += 4;
 }
 
@@ -1615,24 +1634,23 @@ static void execCoproc1x(uint32_t inst, state_t *s) {
       break;
     }
   
-  switch(mi.c1x.fmt)
-   {
-   case 0: {
-     c1xExec<float> e;
-     e(mi, s);
-     return;
-   }
-   case 1: {
-     c1xExec<double> e;
-     e(mi, s);
-     return;
-   }
-   default:
-     std::cerr << "weird type in do_c1x_op @ 0x"
-	       << std::hex << s->pc << std::dec
-	       <<"\n";
-     exit(-1);
-   }
+  /* madd/msub/nmadd/nmsub are id 4..7 with fmt S (0) or D (1).  Everything else
+   * -- luxc1/suxc1 and paired-single are MIPS V, the rest unused -- is RI on the
+   * R5000, not a reason to stop the simulator. */
+  if((mi.c1x.id < 4) || (mi.c1x.fmt > 1)) {
+    raise_ri(s, inst);
+    return;
+  }
+  if(mi.c1x.fmt == 0) {
+    c1xExec<float> e;
+    e(mi, s);
+    s->cpr1_state[mi.c1x.fd] = fp_reg_state::sp;
+  }
+  else {
+    c1xExec<double> e;
+    e(mi, s);
+    s->cpr1_state[mi.c1x.fd] = fp_reg_state::dp;
+  }
 }
 
 
