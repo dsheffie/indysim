@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -25,9 +26,16 @@ enum { WD_OWN_ID=0x00, WD_CONTROL=0x01, WD_CDB=0x03, WD_TARGET_LUN=0x0f,
 /* Auxiliary status bits */
 enum { AUX_DBR=0x01, AUX_CIP=0x10, AUX_BSY=0x20, AUX_LCI=0x40, AUX_INT=0x80 };
 /* WD33C93 commands (low 7 bits of reg 0x18) */
-enum { CMD_RESET=0x00, CMD_SEL_ATN_XFER=0x08, CMD_SEL_XFER=0x09, CMD_XFER_INFO=0x20 };
+enum { CMD_RESET=0x00, CMD_NEGATE_ACK=0x03, CMD_SEL_ATN=0x06, CMD_SEL_ATN_XFER=0x08, CMD_SEL_XFER=0x09,
+       CMD_XFER_INFO=0x20 };
 /* SCSI Status completion codes (reg 0x17) */
 enum { ST_RESET=0x00, ST_SELECT_TRANSFER_SUCCESS=0x16, ST_SELECTION_TIMEOUT=0x42 };
+/* Step-by-step (0x06) interrupts: SELECT, MESSAGE IN paused on ACK, DISCONNECT, and a
+ * target Service Request in a bus phase (0x88 | phase) */
+enum { ST_SELECT=0x11, ST_XFER_DONE=0x18, ST_MSGIN_ACK=0x20, ST_DISC=0x85, ST_SRV_REQ=0x88 };
+enum { BPH_DATA_OUT=0, BPH_DATA_IN=1, BPH_COMMAND=2, BPH_STATUS=3, BPH_MSG_OUT=6, BPH_MSG_IN=7 };
+/* SCSI messages the 0x06 path speaks */
+enum { MSG_COMMAND_COMPLETE=0x00, MSG_EXTENDED=0x01, MSG_SDTR=0x01 };
 /* The single emulated disk lives at this SCSI target ID (SGI Indy system disk =
  * ID 1; IRIX roots on /hw/scsi_ctlr/0/target/1/...). Selecting any other ID
  * times out so the bus scan reports one drive, not one per target. */
@@ -153,6 +161,7 @@ void sgi_scsi::reset() {
   sasr = 0; pos = 0; drq = false; intrq = false; phase = PH_IDLE;
   buf.clear();
   regs[WD_AUX_STATUS] = 0;
+  tphase = TP_NONE; pio.clear(); pio_need = 0; pio_dbr = false; pending_st = 0;
 }
 
 void sgi_scsi::block_read(uint64_t lba, uint8_t *dst) {
@@ -194,6 +203,10 @@ void sgi_scsi::begin_data_out(size_t n) {
 }
 
 void sgi_scsi::finish() {
+  if(decoding_atn) {                     /* 0x06 path: no data phase -> STATUS next */
+    phase = PH_IDLE; drq = false; atn_nodata = true;
+    return;
+  }
   /* drain side-effects for data-out, then post completion status + INTRQ */
   if(phase == PH_DATA_OUT && regs[WD_CDB] == 0x2a) {      /* WRITE(10) -> overlay */
     size_t blocks = buf.size() / 512;
@@ -239,6 +252,7 @@ void sgi_scsi::complete(uint8_t scsi_status) {
   regs[WD_AUX_STATUS]   &= ~(AUX_CIP | AUX_BSY);
   regs[WD_AUX_STATUS]   |= AUX_INT;
   intrq = true; s->irq_poke = true;
+  tphase = TP_NONE;                      /* a Select-and-Transfer ends any 0x06 connection */
   SPRINTF("sgi_scsi: complete status=0x%02x\n", scsi_status);
   { static const bool g_si = getenv("SCSIICNT") != nullptr;
     if(g_si) fprintf(stderr, "[scsi-icnt] %llu\n", (unsigned long long)s->icnt); }
@@ -285,18 +299,28 @@ void sgi_scsi::select_and_transfer() {
    * DISCONNECTED + status SELECTION_TIMEOUT + INTRQ.  This matches the iris WD33C93
    * model; without it the fused model answered as a disk for every target and
    * IRIX's hinv reported 7 drives (one per probed ID). */
-  if(fd < 0 || (regs[WD_DEST_ID] & 7) != DISK_TARGET) {
-    regs[WD_AUX_STATUS]   &= ~(AUX_CIP | AUX_BSY);
-    regs[WD_AUX_STATUS]   |= AUX_INT;
-    regs[WD_SCSI_STATUS]   = ST_SELECTION_TIMEOUT;
-    regs[WD_COMMAND_PHASE] = 0x00;          /* DISCONNECTED: no device selected */
-    intrq = true; s->irq_poke = true;
-    SPRINTF("sgi_scsi: select target %u -> no device (selection timeout)\n",
-            regs[WD_DEST_ID] & 7);
+  if(select_timeout()) {
     return;
   }
-
   regs[WD_AUX_STATUS] |= (AUX_CIP | AUX_BSY);
+  decode_cdb();
+}
+
+bool sgi_scsi::select_timeout() {
+  if(fd >= 0 && (regs[WD_DEST_ID] & 7) == DISK_TARGET) {
+    return false;
+  }
+  regs[WD_AUX_STATUS]   &= ~(AUX_CIP | AUX_BSY);
+  regs[WD_AUX_STATUS]   |= AUX_INT;
+  regs[WD_SCSI_STATUS]   = ST_SELECTION_TIMEOUT;
+  regs[WD_COMMAND_PHASE] = 0x00;          /* DISCONNECTED: no device selected */
+  intrq = true; s->irq_poke = true;
+  SPRINTF("sgi_scsi: select target %u -> no device (selection timeout)\n",
+          regs[WD_DEST_ID] & 7);
+  return true;
+}
+
+void sgi_scsi::decode_cdb() {
   const uint8_t *cdb = &regs[WD_CDB];
   const uint8_t op = cdb[0];
   uint8_t lun = regs[WD_TARGET_LUN] & 7;   /* capture before complete() overwrites 0x0f */
@@ -399,6 +423,152 @@ void sgi_scsi::select_and_transfer() {
   }
 }
 
+/* ---- Select-with-ATN (0x06): one interrupt per bus phase --------------------- */
+
+void sgi_scsi::raise_int(uint8_t st, uint8_t phs) {
+  regs[WD_SCSI_STATUS]   = st;
+  regs[WD_COMMAND_PHASE] = phs;
+  regs[WD_AUX_STATUS]   &= ~(AUX_CIP | AUX_BSY);
+  regs[WD_AUX_STATUS]   |= AUX_INT;
+  intrq = true; s->irq_poke = true;
+  SPRINTF("sgi_scsi: [atn] int status=%02x phase=%02x\n", st, phs);
+}
+
+void sgi_scsi::select_atn() {
+  if(select_timeout()) {
+    return;
+  }
+  /* Selected with ATN: the target answers ATN by asking for MESSAGE OUT, which the
+   * chip reports once the driver has taken the SELECT interrupt (Status read). */
+  tphase = TP_MSG_OUT;
+  phase = PH_IDLE; drq = false; pos = 0; buf.clear();
+  tgt_status = 0x00;
+  raise_int(ST_SELECT, 0x10);
+  pending_st = ST_SRV_REQ | BPH_MSG_OUT;
+}
+
+void sgi_scsi::transfer_info(bool sbt) {
+  /* Transfer Info moves Transfer Count bytes (one in single-byte mode) in the
+   * current bus phase; the data register carries them (DBR in AUX status). */
+  pio.clear();
+  pio_pos = 0;
+  pio_need = sbt ? 1 : ((size_t)regs[0x12] << 16 | (size_t)regs[0x13] << 8 | regs[0x14]);
+  switch(tphase)
+    {
+    case TP_MSG_OUT:
+    case TP_COMMAND:
+      pio_in = false;
+      pio_dbr = pio_need != 0;
+      break;
+    case TP_STATUS:
+      pio_in = true; pio.push_back(tgt_status); pio_dbr = true;
+      break;
+    case TP_MSG_IN:
+      /* up to Transfer Count bytes of the pending message (the SGI PROM takes a 5-byte
+       * SDTR in one go; Linux uses single-byte mode), then the chip stops with ACK held
+       * (status 0x20) until Negate ACK */
+      pio_in = true;
+      pio.assign(msg_in.begin(), msg_in.begin() + std::min(pio_need, msg_in.size()));
+      if(pio.empty()) {
+        pio.push_back(MSG_COMMAND_COMPLETE);
+      }
+      pio_need = pio.size();
+      pio_dbr = true;
+      break;
+    default:
+      /* a PIO data phase: sgiwd93 always uses DMA (level-2 0x08), so not modeled */
+      fprintf(stderr, "sgi_scsi: Transfer Info in bus phase %d not modeled\n", (int)tphase);
+      pio_dbr = false;
+      break;
+    }
+  if(pio_need == 0) {
+    pio_done();
+  }
+}
+
+/* the last byte of a Transfer Info moved: the target changes phase.  A phase change
+ * that ends a Transfer Info is "transfer done" (0x18 | phase); "service request"
+ * (0x88 | phase) is for one with no command in progress (after a selection or Negate
+ * ACK).  Linux takes either, the SGI PROM only the former. */
+void sgi_scsi::pio_done() {
+  pio_dbr = false;
+  switch(tphase)
+    {
+    case TP_MSG_OUT: {
+      /* IDENTIFY, optionally followed by an SDTR (1, 3, 1, period, offset).  Answer
+       * with an SDTR of our own -- the asked-for period, offset 0, i.e. asynchronous.
+       * A MESSAGE REJECT would also mean async to Linux, but the SGI PROM and IRIX
+       * call a rejected SDTR a "SYNC negotiation error" and reset the bus. */
+      const bool sdtr = pio.size() >= 5 && pio[1] == MSG_EXTENDED && pio[3] == MSG_SDTR;
+      if(sdtr) {
+        tphase = TP_MSG_IN;
+        msg_in = {MSG_EXTENDED, 3, MSG_SDTR, pio[4], 0};
+        msg_done = false;
+        raise_int(ST_XFER_DONE | BPH_MSG_IN, 0x20);
+      }
+      else {
+        tphase = TP_COMMAND;
+        raise_int(ST_XFER_DONE | BPH_COMMAND, 0x20);
+      }
+      break;
+    }
+    case TP_COMMAND: {
+      /* the CDB arrived by PIO: decode it as the fused path would, but arm nothing --
+       * the data phase starts when the driver issues a level-2 0x08 (phase 0x45) */
+      for(size_t i = 0; i < pio.size() && i < 12; i++) {
+        regs[WD_CDB + i] = pio[i];
+      }
+      SPRINTF("sgi_scsi: [atn] CDB by PIO (%zu bytes)\n", pio.size());
+      decoding_atn = true; atn_nodata = false;
+      decode_cdb();
+      decoding_atn = false;
+      drq = false;
+      if(atn_nodata) {
+        tphase = TP_STATUS;
+        raise_int(ST_XFER_DONE | BPH_STATUS, 0x30);
+      }
+      else {
+        tphase = TP_DATA;
+        raise_int(ST_XFER_DONE | (phase == PH_DATA_OUT ? BPH_DATA_OUT : BPH_DATA_IN), 0x30);
+      }
+      break;
+    }
+    case TP_STATUS:
+      /* status byte taken: the target goes to MESSAGE IN with COMMAND COMPLETE (the
+       * driver then finishes with a level-2 0x08, Command Phase 0x50) */
+      tphase = TP_MSG_IN;
+      msg_in = {MSG_COMMAND_COMPLETE};
+      msg_done = true;
+      raise_int(ST_XFER_DONE | BPH_MSG_IN, 0x40);
+      break;
+    case TP_MSG_IN:
+      /* message byte taken, ACK held until Negate ACK */
+      raise_int(ST_MSGIN_ACK, 0x50);
+      break;
+    default:
+      break;
+    }
+}
+
+void sgi_scsi::negate_ack() {
+  if(tphase != TP_MSG_IN) {
+    return;
+  }
+  /* the bytes the last Transfer Info delivered are consumed */
+  msg_in.erase(msg_in.begin(), msg_in.begin() + std::min(pio.size(), msg_in.size()));
+  if(!msg_in.empty()) {                /* more of a multi-byte message (the SDTR) */
+    raise_int(ST_SRV_REQ | BPH_MSG_IN, 0x20);
+  }
+  else if(!msg_done) {                 /* the SDTR reply is done: on to COMMAND */
+    tphase = TP_COMMAND;
+    raise_int(ST_SRV_REQ | BPH_COMMAND, 0x20);
+  }
+  else {                               /* COMMAND COMPLETE: the target disconnects */
+    tphase = TP_NONE;
+    raise_int(ST_DISC, 0x60);
+  }
+}
+
 void sgi_scsi::exec_command(uint8_t cc) {
   switch(cc) {
   case CMD_RESET: {
@@ -416,10 +586,34 @@ void sgi_scsi::exec_command(uint8_t cc) {
   }
   case CMD_SEL_ATN_XFER:
   case CMD_SEL_XFER:
-    select_and_transfer();
+    if(tphase == TP_DATA && regs[WD_COMMAND_PHASE] == 0x45) {
+      /* level-2 continuation of a 0x06 command (Linux transfer_bytes): run the data
+       * phase decode_cdb() prepared by DMA; finish() completes it as 0x16 / 0x60 */
+      SPRINTF("sgi_scsi: [atn] level-2 data phase (%zu bytes)\n", buf.size());
+      regs[WD_AUX_STATUS] |= (AUX_CIP | AUX_BSY);
+      drq = true;
+    }
+    else if(tphase == TP_MSG_IN && regs[WD_COMMAND_PHASE] == 0x50) {
+      /* level-2 finish after the status byte: message in + disconnect -> 0x16 / 0x60 */
+      phase = PH_IDLE; drq = false;
+      complete(ST_SELECT_TRANSFER_SUCCESS);
+    }
+    else {
+      select_and_transfer();
+    }
+    break;
+  case CMD_SEL_ATN:
+    select_atn();
+    break;
+  case CMD_NEGATE_ACK:
+    negate_ack();
     break;
   case CMD_XFER_INFO:
-    /* standalone Transfer-Info: data phase already armed by the prior command */
+    /* Transfer Info: the 0x06 path's PIO phases; otherwise (the fused path) the
+     * data phase is already armed by the prior command */
+    if(tphase != TP_NONE) {
+      transfer_info(false);
+    }
     break;
   default:
     SPRINTF("sgi_scsi: unhandled WD33C93 command 0x%02x\n", cc);
@@ -433,7 +627,23 @@ void sgi_scsi::pio_w(uint32_t port, uint8_t v) {
   SPRINTF("sgi_scsi: pio_w port=%u v=%02x (sasr=%02x)\n", port, v, sasr);
   if(port == 0) { sasr = v & 0x1f; return; }       /* SASR: set register pointer */
   /* SCMD: write the selected register */
-  if(sasr == WD_COMMAND) { regs[WD_COMMAND] = v; exec_command(v & 0x7f); return; }
+  if(sasr == WD_COMMAND) {
+    regs[WD_COMMAND] = v;
+    if((v & 0x7f) == CMD_XFER_INFO && tphase != TP_NONE) {
+      transfer_info((v & 0x80) != 0);   /* bit 7 = single-byte transfer */
+    }
+    else {
+      exec_command(v & 0x7f);
+    }
+    return;
+  }
+  if(sasr == WD_DATA && pio_dbr && !pio_in) {       /* 0x06 path: a PIO byte out */
+    pio.push_back(v);
+    if(pio.size() >= pio_need) {
+      pio_done();
+    }
+    return;                                         /* the data register does not advance */
+  }
   regs[sasr] = v;
   sasr = (sasr + 1) & 0x1f;                         /* auto-increment */
 }
@@ -442,7 +652,7 @@ uint8_t sgi_scsi::pio_r(uint32_t port) {
   if(port == 0) {                                   /* SASR read = aux status */
     uint8_t a = 0;
     if(intrq) a |= AUX_INT;
-    if(drq)   a |= AUX_DBR;
+    if(drq || pio_dbr) a |= AUX_DBR;
     { static int auxlog = 0;
       if(scsi_verbose && auxlog < scsi_auxmax) {
         fprintf(stderr, "sgi_scsi: pio_r AUX -> %02x (intrq=%d) @icnt=%llu\n",
@@ -455,7 +665,20 @@ uint8_t sgi_scsi::pio_r(uint32_t port) {
     intrq = false; regs[WD_AUX_STATUS] &= ~AUX_INT;
     SPRINTF("sgi_scsi: pio_r reg=%02x -> %02x\n", (unsigned)sasr, st);
     sasr = (sasr + 1) & 0x1f;
+    if(pending_st) {                                /* 0x06: the next phase's request */
+      const uint8_t p = pending_st;
+      pending_st = 0;
+      raise_int(p, 0x10);
+    }
     return st;
+  }
+  if(sasr == WD_DATA && pio_dbr && pio_in) {        /* 0x06 path: a PIO byte in */
+    const uint8_t b = (pio_pos < pio.size()) ? pio[pio_pos] : 0;
+    pio_pos++;
+    if(pio_pos >= pio.size()) {
+      pio_done();
+    }
+    return b;                                       /* the data register does not advance */
   }
   uint8_t r = regs[sasr];
   SPRINTF("sgi_scsi: pio_r reg=%02x -> %02x\n", (unsigned)sasr, r);

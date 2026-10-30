@@ -2,6 +2,7 @@
 #define __sgi_scc__
 
 #include <cstdint>
+#include <cstdio>
 #include <cstddef>
 
 struct state_t;
@@ -70,6 +71,11 @@ public:
     }
   }
   bool    int_pending();                /* SCC INT line: TxIE & Tx-IP, or Rx char available */
+  /* SIGUSR1 interrupt-state dump (main.cc service_lean_signals) */
+  void    dump(FILE *fp) const {
+    fprintf(fp, "[irq] scc: wr9=%02x wr1 B=%02x A=%02x tx_busy B=%d A=%d tx_ip B=%d A=%d rx_count=%u\n",
+            wr9, wr1[0], wr1[1], tx_busy[0], tx_busy[1], tx_ip[0], tx_ip[1], rx_count);
+  }
 };
 
 #endif

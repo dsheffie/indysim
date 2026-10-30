@@ -8,6 +8,9 @@
 #include "sgi_mc.hh"
 #include "cache_model.hh"
 #include "sclog.hh"
+#include "globals.hh"
+
+static sgi_scsi *ip28_scsi1(state_t *s);   /* --ip28 second WD33C93, below */
 #include <cassert>
 #include <cstdlib>
 #include <ctime>
@@ -85,6 +88,30 @@ static uint32_t rtc_hundredths(state_t *s) {
  * reported mips_hpt_frequency = 1e6 * RATIO and reported CPU = 2 * RATIO MHz.
  * RATIO=50 -> 100 MHz, matching the Ultra96 r9999 FPGA core clock. */
 static const uint32_t T2_RATIO = 50;
+/* --ip28: counters 0 and 1 count counter 2's output, not the 1 MHz clock: startrtclock
+ * loads counter 2 with 200 and counter 0 with 50 -> 1 MHz / 200 / 50 = 100 Hz */
+uint32_t sgi_hpc::pit_period(uint16_t load) const {
+  const uint64_t n0 = load ? load : 0x10000u;
+  const uint64_t n2 = t2_load ? t2_load : 0x10000u;
+  const uint64_t p = n0 * n2 * T2_RATIO;
+  return (p < (1u << 30)) ? (uint32_t)p : (1u << 30);
+}
+
+bool sgi_hpc::pit_irq(int n) {
+  pit_counter_t &c = pit[n];
+  if(c.armed) {
+    const uint32_t now = s->cpr0[CPR0_COUNT];
+    if((int32_t)(now - c.next_fire) >= 0) {
+      c.irq = true;
+      c.period = pit_period(c.load);  /* counter 2 (the prescaler) may have been reloaded */
+      do {                          /* missed terminal counts collapse into one */
+        c.next_fire += c.period;
+      } while((int32_t)(now - c.next_fire) >= 0);
+    }
+  }
+  return c.irq;
+}
+
 uint16_t sgi_hpc::t2_value() {
   uint32_t elapsed = (uint32_t)(s->cpr0[CPR0_COUNT] - t2_count_at_load);
   uint32_t dec = elapsed / T2_RATIO;
@@ -416,6 +443,20 @@ uint8_t sgi_hpc::ioc2_local0_live() {
   uint8_t st = ioc2_local_status[0];
   if(s->scsi && s->scsi->intrq_pending()) st |= 0x02u;
   else                                    st &= ~0x02u;
+  { /* SCSIIRQDBG: each change of the WD93 INTRQ as local0 sees it, with the mask */
+    static const bool g_dbg = getenv("SCSIIRQDBG") != nullptr;
+    static bool last = false;
+    const bool now = (st & 0x02u) != 0;
+    if(g_dbg && now != last) {
+      fprintf(stderr, "[scsiirq] icnt=%llu intrq=%d mask0=%02x SR=%08x Cause=%08x pc=%016llx\n",
+              (unsigned long long)s->icnt, now, ioc2_local_mask[0], (uint32_t)s->cpr0[CPR0_SR],
+              (uint32_t)s->cpr0[CPR0_CAUSE], (unsigned long long)s->pc);
+      last = now;
+    }
+  }
+  if(globals::ip28) {                     /* Full House: SCSI1 INTRQ = bit 2 */
+    st = ip28_scsi1(s)->intrq_pending() ? (st | 0x04u) : (st & ~0x04u);
+  }
   /* ENET (bit3): the CPU interrupt is the HPC3 DMA-channel XIE latch (intstat bits
    * 10/11), cleared by the ENET reset reg CLRIRQ. The Seeq's own INTRQ is consumed
    * by the HPC internally (per-frame DMA'd status), NOT routed to IP2 -- folding it
@@ -537,6 +578,9 @@ uint32_t sgi_hpc::read_impl(uint32_t offs, size_t sz) {
     if(s->scsi) return s->scsi->pio_r(((offs - 0x40000) >> 2) & 1);
     return 0;
   }
+  else if(globals::ip28 and offs >= 0x00048000 and offs <= 0x0004ffff) { /* WD33C93 HD1 */
+    return ip28_scsi1(s)->pio_r(((offs - 0x48000) >> 2) & 1);
+  }
   else if(offs == 0x30000) {      /* istat0: interrupt status [4:0] */
     return intstat;
   }
@@ -548,7 +592,13 @@ uint32_t sgi_hpc::read_impl(uint32_t offs, size_t sz) {
      * to pick the system type. (MAME co-sim, MAME_QUESTIONS.md Q5 round-3.)
      * Return it pre-byte-swapped (like the MC mconfig regs): the load path
      * bswaps device reads, so the kernel sees 0x26 in byte [7:0]. */
-    return 0x26000000u;
+    /* --ip28: 0x1b = Full House (bit 0), board rev 13 -- IRIX warns "CPU baseboard
+     * downrev (IP26 not IP28)" below 13 (IRIS src/dev/ioc.rs) */
+    return globals::ip28 ? 0x1b000000u : 0x26000000u;
+  }
+  else if(offs == 0x5985b) {      /* the same System ID as a byte (Linux: sgioc->sysid,
+                                   * ip22_is_fullhouse() tests its bit 0) */
+    return globals::ip28 ? 0x1bu : 0x26u;
   }
   /* IOC2/INT2 local interrupt status/mask (byte regs at IOC2 off N -> 0x59800+N*4+3) */
   else if(offs == 0x59883) { return ioc2_local0_live(); }   /* local0 status */
@@ -705,7 +755,174 @@ void sgi_hpc::rtc_write(uint32_t reg, uint8_t v) {
 /* full HPC3 register access log, for diffing against another implementation */
 static const bool hpc_access_log = getenv("HPCDBG") != nullptr;
 
+/* --ip28: Full House's INT2 (and the 8254 with it) sits at IOC offset 0x59000, where
+ * the Indy has ISDN; INT3 in the IOC2 is the same register file at 0x59880 ("the base
+ * address will change from 0x1FBD9000 to 0x1FBD9880", IOC2 spec, Guinness/Full House
+ * differences).  INT2's LED register lands on INT3's Map Pol. */
+static inline uint32_t ip28_int2(uint32_t offs) {
+  return (globals::ip28 and offs >= 0x59000u and offs < 0x59040u) ? (offs + 0x880u) : offs;
+}
+
+/* --ip28: Full House keeps the PROM environment and the MAC in a 93CS56 (128 x 16)
+ * serial EEPROM on the HPC3's eeprom register (0x30008, byte lane 0x3000b), where the
+ * Indy uses the ds1386's RAM.  The PROM bit-bangs it: bit 1 CS, bit 2 SK, bit 3 DI,
+ * bit 4 DO.  Commands are a start bit, 2 opcode bits and 8 address bits (the top
+ * address bit is don't-care); READ shifts out a dummy 0 then D15..D0.  Not persisted.
+ * Protocol and the erased-part defaults below follow IRIS (src/dev/eeprom_93c56.rs). */
+struct ip28_eeprom_t {
+  enum class st_t { standby, idle, opcode, address, data_in, data_out };
+  uint16_t data[128];
+  st_t st = st_t::standby;
+  bool cs = false, sk = false, do_pin = true, wen = false;
+  uint32_t reg = 0, shifter = 0, nbits = 0, opcode = 0, addr = 0;
+
+  /* an erased IP28 EEPROM as the PROM's defaults leave it: layout revision 9, a few
+   * env defaults, the MAC in words 0x7d..0x7f and the checksum in byte 0 */
+  ip28_eeprom_t() {
+    uint8_t b[256] = {0};
+    b[1] = 9;
+    static const struct { int off; const char *v; } defs[] = {
+      {2, "g"}, {116, "9600"}, {121, "0"}, {122, "PST8PDT"}, {178, "Y"},
+      {232, "80"}, {235, "0"}, {236, "y"}, {239, "y"}, {242, "1"},
+    };
+    for(const auto &d : defs) {
+      memcpy(b + d.off, d.v, strlen(d.v));
+    }
+    for(int i = 0; i < 128; i++) {
+      data[i] = (uint16_t)((b[2*i] << 8) | b[2*i+1]);
+    }
+    data[0x7d] = 0x0800; data[0x7e] = 0x6912; data[0x7f] = 0x3456;   /* 08:00:69:12:34:56 */
+    uint8_t ck = 0xa5;
+    for(int i = 0; i < 128; i++) {
+      ck ^= (uint8_t)data[i];
+      if(i != 0) {
+        ck ^= (uint8_t)(data[i] >> 8);
+      }
+      ck = (uint8_t)((ck << 1) | (ck >> 7));
+    }
+    data[0] = (uint16_t)((data[0] & 0xff) | (ck << 8));
+  }
+  uint8_t read() const {
+    return (uint8_t)((reg & ~0x10u) | (do_pin ? 0x10u : 0u));
+  }
+  void write(uint8_t v) {
+    reg = v;
+    const bool ncs = (v >> 1) & 1, nsk = (v >> 2) & 1, di = (v >> 3) & 1;
+    if(ncs != cs) {
+      cs = ncs;
+      st = cs ? st_t::idle : st_t::standby;
+      if(!cs) {
+        do_pin = true;
+      }
+    }
+    const bool rising = nsk and not sk;
+    sk = nsk;
+    if(cs and rising) {
+      tick(di);
+    }
+  }
+  void tick(bool di) {
+    switch(st)
+      {
+      case st_t::standby:
+        break;
+      case st_t::idle:
+        if(di) {
+          st = st_t::opcode;
+          nbits = shifter = 0;
+        }
+        break;
+      case st_t::opcode:
+        shifter = (shifter << 1) | di;
+        if(++nbits == 2) {
+          opcode = shifter & 3;
+          st = st_t::address;
+          nbits = shifter = 0;
+        }
+        break;
+      case st_t::address:
+        shifter = (shifter << 1) | di;
+        if(++nbits < 8) {
+          break;
+        }
+        addr = shifter & 0xff;
+        nbits = shifter = 0;
+        st = st_t::idle;
+        if(opcode == 2) {                              /* READ */
+          shifter = data[addr & 0x7f];
+          do_pin = false;                              /* the dummy 0 */
+          st = st_t::data_out;
+        }
+        else if(opcode == 1 or (opcode == 0 and (addr >> 6) == 1)) {   /* WRITE, WRAL */
+          if(wen) {
+            st = st_t::data_in;
+          }
+        }
+        else if(opcode == 3) {                         /* ERASE */
+          if(wen) {
+            data[addr & 0x7f] = 0xffff;
+          }
+        }
+        else if((addr >> 6) == 2) {                    /* ERAL */
+          if(wen) {
+            for(auto &w : data) {
+              w = 0xffff;
+            }
+          }
+        }
+        else {
+          wen = ((addr >> 6) == 3);                    /* EWEN; EWDS = 0 */
+        }
+        break;
+      case st_t::data_in:
+        shifter = (shifter << 1) | di;
+        if(++nbits == 16) {
+          if(opcode == 1) {
+            data[addr & 0x7f] = (uint16_t)shifter;
+          }
+          else {
+            for(auto &w : data) {
+              w = (uint16_t)shifter;
+            }
+          }
+          st = st_t::idle;
+        }
+        break;
+      case st_t::data_out:
+        if(nbits < 16) {
+          do_pin = (shifter >> (15 - nbits)) & 1;
+          nbits++;
+        }
+        else {
+          do_pin = true;
+          st = st_t::idle;
+        }
+        break;
+      }
+  }
+};
+static ip28_eeprom_t g_ip28_eeprom;
+
+/* --ip28: Full House's second WD33C93 (HD1, registers at 0x48000, local0 bit 2).
+ * Nothing is attached: it is here for the PROM's "SCSI controller 1" diagnostic.
+ * Created on first use; no DMA channel is wired to it. */
+static sgi_scsi *ip28_scsi1(state_t *s) {
+  static sgi_scsi *scsi1 = new sgi_scsi(s, "");
+  return scsi1;
+}
+
 uint32_t sgi_hpc::read(uint32_t offs, size_t sz) {
+  offs = ip28_int2(offs);
+  /* SCSI1DBG: the --ip28 second SCSI controller -- WD33C93 HD1 regs and HPC3 DMA ch1 */
+  static const bool g_scsi1_dbg = getenv("SCSI1DBG") != nullptr;
+  if(g_scsi1_dbg and ((offs >= 0x48000 and offs <= 0x4ffff) or (offs >= 0x12000 and offs <= 0x13fff))) {
+    fprintf(stderr, "[scsi1] R offs=%05x sz=%zu icnt=%llu pc=%016llx\n", offs, sz,
+            (unsigned long long)s->icnt, (unsigned long long)s->pc);
+  }
+  if(globals::ip28 and (offs == 0x30008u or offs == 0x3000bu)) {
+    const uint8_t v = g_ip28_eeprom.read();
+    return (sz == 1) ? v : ((uint32_t)v << 24);
+  }
   /* IOC2 regs 0x10/0x11: 8042 data, status (byte at +3; word reads carry it in [31:24]) */
   if(s->ps2 && (offs & ~7u) == 0x59840u) {
     const uint8_t v = s->ps2->read((offs & 4) != 0);
@@ -719,6 +936,16 @@ uint32_t sgi_hpc::read(uint32_t offs, size_t sz) {
 }
 
 void sgi_hpc::write(uint32_t offs, uint32_t x, size_t sz) {
+  offs = ip28_int2(offs);
+  static const bool g_scsi1_dbg = getenv("SCSI1DBG") != nullptr;
+  if(g_scsi1_dbg and ((offs >= 0x48000 and offs <= 0x4ffff) or (offs >= 0x12000 and offs <= 0x13fff))) {
+    fprintf(stderr, "[scsi1] W offs=%05x v=%08x sz=%zu icnt=%llu pc=%016llx\n", offs, x, sz,
+            (unsigned long long)s->icnt, (unsigned long long)s->pc);
+  }
+  if(globals::ip28 and (offs == 0x30008u or offs == 0x3000bu)) {
+    g_ip28_eeprom.write((sz == 1) ? (uint8_t)x : (uint8_t)(x >> 24));
+    return;
+  }
   //assert(sz == 4);
   if(s->ps2 && (offs & ~7u) == 0x59840u) {
     s->ps2->write((offs & 4) != 0, (sz == 1) ? (uint8_t)x : (uint8_t)(x >> 24));
@@ -736,6 +963,57 @@ void sgi_hpc::write(uint32_t offs, uint32_t x, size_t sz) {
                      (offs >= 0x54000 and offs <= 0x5401f) or
                      (offs >= 0x60000 and offs <= 0x67fff))) {
     fprintf(stderr, "ENET-W pc=%08x offs=%05x val=%08x sz=%zu\n", s->pc, offs, x, sz);
+  }
+  if(globals::ip28 and offs == 0x598bf and ((x >> 6) & 3) < 2) {
+    /* i8254 control word for counter 0 or 1 (SC = bits 7:6): RW=both -> expect a
+     * two-byte reload; a latch command (RW=00) has nothing to snapshot here */
+    pit_counter_t &c = pit[(x >> 6) & 1];
+    if(((x >> 4) & 3) != 0) {
+      c.loading = true;
+      c.wr_phase = 0;
+    }
+    return;
+  }
+  if(globals::ip28 and (offs == 0x598b3 or offs == 0x598b7)) {
+    /* i8254 counter 0 (0x598b3) / 1 (0x598b7): low byte then high byte; the
+     * high byte (re)starts the counter as a rate generator */
+    pit_counter_t &c = pit[(offs == 0x598b7) ? 1 : 0];
+    if(c.loading) {
+      if(c.wr_phase == 0) {
+        c.load = (c.load & 0xff00) | (x & 0xff);
+        c.wr_phase = 1;
+      }
+      else {
+        c.load = (c.load & 0x00ff) | ((x & 0xff) << 8);
+        c.wr_phase = 0;
+        c.loading = false;
+        c.period = pit_period(c.load);
+        c.next_fire = s->cpr0[CPR0_COUNT] + c.period;
+        c.armed = true;
+        static const bool g_pit_dbg = getenv("PITDBG") != nullptr;
+        if(g_pit_dbg) {
+          fprintf(stderr, "[pit] arm ctr%d load=%u period=%u count=%08x pc=%016llx\n", (offs == 0x598b7) ? 1 : 0,
+                  c.load, c.period, s->cpr0[CPR0_COUNT], (unsigned long long)s->pc);
+        }
+      }
+    }
+    return;
+  }
+  if(globals::ip28 and offs == 0x598a3) {   /* timer interrupt clear: bit 0 / bit 1 */
+    static const bool g_pit_dbg = getenv("PITDBG") != nullptr;
+    static uint64_t n_ack = 0;
+    ++n_ack;
+    if(g_pit_dbg and ((n_ack & (n_ack - 1)) == 0)) {
+      fprintf(stderr, "[pit] ack #%llu x=%x irq0=%d irq1=%d count=%08x next0=%08x next1=%08x\n", (unsigned long long)n_ack,
+              x, pit[0].irq, pit[1].irq, s->cpr0[CPR0_COUNT], pit[0].next_fire, pit[1].next_fire);
+    }
+    if(x & 1) {
+      pit[0].irq = false;
+    }
+    if(x & 2) {
+      pit[1].irq = false;
+    }
+    return;
   }
   if(offs == 0x598bf) {           /* i8254 control word (tcword) */
     if(((x >> 4) & 0x3) == 0) {   /* RW=00: counter-latch command -> snapshot live value */
@@ -876,6 +1154,9 @@ void sgi_hpc::write(uint32_t offs, uint32_t x, size_t sz) {
       /* a COMMAND-register write may assert DRQ; service it if the channel is armed */
       if(scsi_dma[0].active && s->scsi->drq_pending()) scsi_run_dma(0);
     }
+  }
+  else if(globals::ip28 and offs >= 0x48000 and offs <= 0x4ffff) { /* WD33C93 HD1 */
+    ip28_scsi1(s)->pio_w(((offs - 0x48000) >> 2) & 1, (uint8_t)x);
   }
   else if(offs >= 0x00058000 and offs <= 0x0005bfff) { /* PBUS PIO data ports */
     int id = ((offs>>8) & 0x7f)>>2;

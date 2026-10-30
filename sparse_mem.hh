@@ -139,8 +139,21 @@ public:
    * vectors (phys 0x0 / 0x80) and the SPB/romvec the FSBL stages at phys 0x1000
    * reach the same DRAM the kernel sees at 0x08000000. */
   static inline uint64_t mc_alias(uint64_t pa) {
-    return (pa < 0x00080000UL) ? (pa + 0x08000000UL) : pa;
+    if(pa < 0x00080000UL) {
+      return pa + 0x08000000UL;
+    }
+    /* --ip28: memory decodes at 0x20000000, but bank 0's 256 MB is stored at
+     * 0x08000000 (interpret.cc ip28_mem_window, which the CPU path applies with the
+     * live MEMCFG).  DMA engines (HPC3, MC) hand out the real PA; fold it the same
+     * way so a device and the CPU see the same bytes.  Fixed, not MEMCFG-driven:
+     * DMA only runs once the PROM has placed bank 0 at 0x20000000.  The low alias
+     * above stays right: it mirrors the base of memory, i.e. 0x20000000. */
+    if(ip28_bank0 and (pa >> 28) == 2) {
+      return 0x08000000UL + (pa & 0x0fffffffUL);
+    }
+    return pa;
   }
+  static inline bool ip28_bank0 = false;
   /* raw host pointer for DMA and other non-CPU accessors.  Callers may write through it,
    * so a decoded code page is invalidated conservatively; read-only users that are hot
    * (or must not disturb the decode cache) use peek_raw_ptr. */

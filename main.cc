@@ -1,4 +1,5 @@
 #include <cstdio>
+#include <cinttypes>
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
@@ -82,6 +83,8 @@ static void pcring_dump() {
   fprintf(stderr, "[pcring] wrote %llu entries to %s\n", (unsigned long long)n, out.c_str());
 }
 
+static void putbuf_dump(state_t *s);   /* PUTBUF=..., below */
+static void pchook_ring_dump(state_t *s);   /* PCHOOK=..., below */
 /* the lean loop's share of the signal work (the full loop does its own below) */
 static void service_lean_signals(state_t *s) {
   g_sig_any = 0;
@@ -90,6 +93,16 @@ static void service_lean_signals(state_t *s) {
     dump_current_process(s);
     tlbpm_report();
     pcring_dump();
+    putbuf_dump(s);
+    pchook_ring_dump(s);
+    fprintf(stderr, "[irq] icnt=%llu SR=%08x Cause=%08x\n", (unsigned long long)s->icnt,
+            (uint32_t)s->cpr0[CPR0_SR], (uint32_t)s->cpr0[CPR0_CAUSE]);
+    if(s->hpc) {
+      s->hpc->dump_irq(stderr);
+    }
+    if(s->scc) {
+      s->scc->dump(stderr);
+    }
   }
   if(g_sig_flushdelta) {
     g_sig_flushdelta = 0;
@@ -116,8 +129,135 @@ namespace globals {
   bool pctrace_on = false;
   bool asidpc_armed = false;   /* SIGUSR1 toggles; gates the ASIDPC userspace dump */
   bool cpu_r5000 = false;
+  bool cpu_r10000 = false;
+  bool ip28 = false;
 };
 static state_t *s = nullptr;
+
+/* PCHOOK=<hex>,<hex>,... (with PCRING, whose loop instance checks it): log each time
+ * execution reaches one of these PCs -- icnt, a0..a3, and up to 64 bytes at a1 when
+ * a1 is an unmapped kernel address (XKPHYS or compat kseg0/1) and a2 is a small count.
+ * For finding which console path (ARCS arcs_write vs the du driver) emits a byte. */
+static uint64_t g_pchook[8];
+static uint64_t g_pchook_count[8];      /* hits per hooked PC, printed with the ring */
+static int g_npchook = 0;
+static uint64_t g_pchook_hits = 0;
+/* ...and the last 512 hits are kept in a ring that SIGUSR1 writes out (PCHOOKRING=1
+ * logs only to the ring: for a stall, what was called last, not first) */
+struct pchook_ev_t { uint64_t icnt, pc, v0, a0, a1, a2, a3, ra; };
+static pchook_ev_t g_pchook_ring[512];
+static void pchook_ring_dump(state_t *s) {
+  if(g_npchook == 0) {
+    return;
+  }
+  for(int i = 0; i < g_npchook; i++) {
+    fprintf(stderr, "[pchook-count] icnt=%llu pc=%016llx hits=%llu\n", (unsigned long long)s->icnt,
+            (unsigned long long)g_pchook[i], (unsigned long long)g_pchook_count[i]);
+  }
+  const uint64_t n = g_pchook_hits < 512 ? g_pchook_hits : 512;
+  fprintf(stderr, "[pchook] last %llu of %llu hits:\n", (unsigned long long)n, (unsigned long long)g_pchook_hits);
+  for(uint64_t i = g_pchook_hits - n; i != g_pchook_hits; i++) {
+    const pchook_ev_t &e = g_pchook_ring[i & 511];
+    fprintf(stderr, "[pchook-ring] icnt=%llu pc=%016llx v0=%llx a0=%llx a1=%llx a2=%llx a3=%llx ra=%llx\n",
+            (unsigned long long)e.icnt, (unsigned long long)e.pc, (unsigned long long)e.v0,
+            (unsigned long long)e.a0, (unsigned long long)e.a1, (unsigned long long)e.a2,
+            (unsigned long long)e.a3, (unsigned long long)e.ra);
+  }
+}
+static void pchook_log(state_t *s) {
+  g_pchook_ring[g_pchook_hits & 511] = {s->icnt, (uint64_t)s->pc, (uint64_t)s->gpr[2], (uint64_t)s->gpr[4],
+                                        (uint64_t)s->gpr[5], (uint64_t)s->gpr[6], (uint64_t)s->gpr[7],
+                                        (uint64_t)s->gpr[31]};
+  static const bool g_ring_only = getenv("PCHOOKRING") != nullptr;
+  if(++g_pchook_hits > 5000 || g_ring_only) {
+    return;
+  }
+  const uint64_t a1 = s->gpr[5], a2 = s->gpr[6];
+  fprintf(stderr, "[pchook] icnt=%llu pc=%016llx a0=%llx a1=%llx a2=%llx a3=%llx ra=%llx",
+          (unsigned long long)s->icnt, (unsigned long long)s->pc, (unsigned long long)s->gpr[4],
+          (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)s->gpr[7],
+          (unsigned long long)s->gpr[31]);
+  uint64_t pa = ~0ULL;
+  if((a1 >> 62) == 2) {
+    pa = a1 & 0xffffffffffULL;                 /* XKPHYS */
+  }
+  else if((a1 >> 32) == 0xffffffffULL && ((a1 >> 30) & 3) == 2) {
+    pa = a1 & 0x1fffffffULL;                   /* compat kseg0/kseg1 */
+  }
+  if(pa != ~0ULL && a2 > 0 && a2 <= 256) {
+    fprintf(stderr, " \"");
+    for(uint64_t i = 0; i < a2 && i < 64; i++) {
+      const uint8_t c = *s->mem.peek_raw_ptr(pa + i);
+      if(c >= 0x20 && c < 0x7f) {
+        fputc(c, stderr);
+      }
+      else {
+        fprintf(stderr, "\\x%02x", c);
+      }
+    }
+    fprintf(stderr, "\"");
+  }
+  fputc('\n', stderr);
+}
+
+/* guest kernel VA -> PA for the unmapped segments only (XKPHYS, compat kseg0/1);
+ * ~0 for anything that needs the TLB */
+static uint64_t kva_to_pa(uint64_t va) {
+  if((va >> 62) == 2) {
+    return va & 0xffffffffffULL;
+  }
+  if((va >> 32) == 0xffffffffULL && ((va >> 30) & 3) == 2) {
+    return va & 0x1fffffffULL;
+  }
+  return ~0ULL;
+}
+static uint64_t peek_be(state_t *s, uint64_t pa, int n) {
+  uint64_t v = 0;
+  for(int i = 0; i < n; i++) {
+    v = (v << 8) | *s->mem.peek_raw_ptr(pa + i);
+  }
+  return v;
+}
+/* PUTBUF=<&putbuf>,<&putbufndx>,<&putbufsz> (kernel symbol addresses, nm): on SIGUSR1
+ * write the IRIX kernel message buffer, oldest first, to putbuf.<n>.txt -- messages
+ * the kernel logged that never reached the console. */
+static void putbuf_dump(state_t *s) {
+  static const char *g_pb = getenv("PUTBUF");
+  static int dumps = 0;
+  if(g_pb == nullptr) {
+    return;
+  }
+  uint64_t a[3] = {0, 0, 0};
+  if(sscanf(g_pb, "%" SCNx64 ",%" SCNx64 ",%" SCNx64, &a[0], &a[1], &a[2]) != 3) {
+    fprintf(stderr, "[putbuf] PUTBUF needs three hex addresses\n");
+    return;
+  }
+  const uint64_t pp = kva_to_pa(a[0]), pn = kva_to_pa(a[1]), pz = kva_to_pa(a[2]);
+  if(pp == ~0ULL || pn == ~0ULL || pz == ~0ULL) {
+    fprintf(stderr, "[putbuf] symbol addresses must be unmapped (XKPHYS/kseg0)\n");
+    return;
+  }
+  const uint64_t buf = kva_to_pa(peek_be(s, pp, 8));
+  const uint32_t ndx = (uint32_t)peek_be(s, pn, 4), sz = (uint32_t)peek_be(s, pz, 4);
+  if(buf == ~0ULL || sz == 0 || sz > (1u << 20)) {
+    fprintf(stderr, "[putbuf] bad buffer: ptr pa=%llx ndx=%u sz=%u\n", (unsigned long long)buf, ndx, sz);
+    return;
+  }
+  const std::string out = "putbuf." + std::to_string(dumps++) + ".txt";
+  FILE *fp = fopen(out.c_str(), "wb");
+  if(fp == nullptr) {
+    perror(out.c_str());
+    return;
+  }
+  for(uint32_t i = 0; i < sz; i++) {
+    const uint8_t c = *s->mem.peek_raw_ptr(buf + (ndx + i) % sz);
+    if(c != 0) {
+      fputc(c, fp);
+    }
+  }
+  fclose(fp);
+  fprintf(stderr, "[putbuf] ndx=%u sz=%u -> %s\n", ndx, sz, out.c_str());
+}
 
 /* one lean-loop instruction.  DBG picks execMips' instance (and services gdb), RING
  * records {ASID, PC}; both are fixed per loop instance.  Signals are checked every
@@ -127,6 +267,12 @@ static inline void lean_step(state_t *s, uint32_t &sigpoll) {
   maybe_take_interrupt_inline(s);   /* CP0 Count/Compare timer + Int delivery (per step) */
   if constexpr(RING) {
     g_pcring[g_pcring_pos++ & g_pcring_mask] = ((uint64_t)(s->cpr0[CPR0_ENTRYHI] & 0xff) << 32) | (uint32_t)s->pc;
+    for(int i = 0; i < g_npchook; i++) {
+      if(s->pc == g_pchook[i]) {
+        g_pchook_count[i]++;
+        pchook_log(s);
+      }
+    }
   }
   if constexpr(DBG) {
     if(s->gdb) {
@@ -204,7 +350,8 @@ int main(int argc, char *argv[]) {
       ("restore", po::value<std::string>(&restore_name)->default_value(""), "restore a full-state checkpoint (loadState) and continue from it")
       ("gdb", po::value<int>(&gdb_port)->default_value(0), "listen for gdb on this TCP port (RSP stub); boots full-speed until a client attaches")
       ("cosim", po::value<std::string>(&cosim), "lockstep co-sim: 'server' (golden) or 'client'; run both sims with DETTIME=1")
-      ("cpu", po::value<std::string>(&cpu)->default_value("r4400"), "CPU model: r4400 (MIPS III, matches r9999) or r5000 (R5000PC Indy: MIPS IV, 32K+32K L1, no L2)");
+      ("ip28", po::bool_switch(&globals::ip28), "Indigo2 R10000 (IP28) board: INT2 at 0x1fbd9000 and an MC rev D, for the IP28 PROM")
+      ("cpu", po::value<std::string>(&cpu)->default_value("r4400"), "CPU model: r4400 (MIPS III, matches r9999) r5000 (R5000PC Indy: MIPS IV, 32K+32K L1, no L2) or r10000 (IP28: MIPS IV, 64-entry TLB)");
     po::variables_map vm;
     po::store(po::parse_command_line(argc, argv, desc), vm);
     po::notify(vm);
@@ -212,8 +359,12 @@ int main(int argc, char *argv[]) {
   if(cpu == "r5000") {
     globals::cpu_r5000 = true;
   }
+  else if(cpu == "r10000") {
+    globals::cpu_r5000 = true;
+    globals::cpu_r10000 = true;
+  }
   else if(cpu != "r4400") {
-    std::cerr << "--cpu must be r4400 or r5000\n";
+    std::cerr << "--cpu must be r4400, r5000 or r10000\n";
     return 1;
   }
 
@@ -262,8 +413,12 @@ int main(int argc, char *argv[]) {
       }
     }
   }
+  if(globals::ip28 and s->ps2 == nullptr) {
+    s->ps2 = new sgi_ps2(s);     /* --ip28: the PROM's POST tests the 8042 even with no graphics */
+  }
   sm->st = s;
   sm->route_devices = !virt;   /* virt: no IP22 low-memory alias, no device window */
+  sparse_mem::ip28_bank0 = globals::ip28;
 
   initState(s);                    /* CP0 reset state: PRId, Config, SR, Random */
   if(not(filename.empty())) {
@@ -451,6 +606,14 @@ int main(int argc, char *argv[]) {
     g_pcring = new uint64_t[g_pcring_mask + 1]();
     fprintf(stderr, "[pcring] %llu entries; kill -USR1 %d to write pcring.<n>.bin\n",
             (unsigned long long)(g_pcring_mask + 1), (int)getpid());
+    if(const char *ph = getenv("PCHOOK")) {
+      for(const char *p = ph; *p != 0 && g_npchook < 8; ) {
+        char *end = nullptr;
+        g_pchook[g_npchook++] = strtoull(p, &end, 16);
+        p = (*end == ',') ? end + 1 : end;
+      }
+      fprintf(stderr, "[pchook] %d entry PCs\n", g_npchook);
+    }
   }
   if(lean) {
     if(globals::exec_dbg) {

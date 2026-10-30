@@ -97,6 +97,7 @@ public:
   void write(uint32_t offs, uint32_t x, size_t sz);  
   /* mconfig0 in CPU order (bank0 [31:16], bank1 [15:0]): the PROM's bank-probe window */
   uint32_t memcfg0_cpu() const { return __builtin_bswap32(memcfg[0]); }
+  uint32_t memcfg1_cpu() const { return __builtin_bswap32(memcfg[1]); }
 };
 
 

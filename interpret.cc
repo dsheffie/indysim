@@ -36,6 +36,11 @@
  * corrupting anything that sets a non-default mode (e.g. libc's %f dtoa). */
 extern "C" {
 #include "softfloat/source/include/softfloat.h"
+
+/* TLB entries the model presents: the R4000 family's 48, the R10000's 64 */
+static inline int tlb_entries() {
+  return globals::cpu_r10000 ? state_t::MAX_TLB_ENTRIES : state_t::NUM_TLB_ENTRIES;
+}
 }
 
 /* host double/float <-> softfloat bit-container (pure reinterpret, no rounding) */
@@ -239,9 +244,9 @@ void initState(state_t *s) {
   s->cpr0[CPR0_SR] |= SR_ERL | SR_BEV | SR_CU0 | SR_CU2;
   xctx_update(s);
   /* Random starts at max TLB index; it cycles downward to Wired */
-  s->cpr0[CPR0_RANDOM] = state_t::NUM_TLB_ENTRIES - 1;
+  s->cpr0[CPR0_RANDOM] = tlb_entries() - 1;
   /* PRId: read-only processor id (R4000 family for now) */
-  { const char *pe = getenv("PRID"); uint32_t pv = pe ? (uint32_t)strtoull(pe,0,0) : (globals::cpu_r5000 ? PRID_R5000 : PRID_VALUE);
+  { const char *pe = getenv("PRID"); uint32_t pv = pe ? (uint32_t)strtoull(pe,0,0) : (globals::cpu_r10000 ? PRID_R10000 : globals::cpu_r5000 ? PRID_R5000 : PRID_VALUE);
     s->cpr0[CPR0_PRID] = pv; s->cpr0_64[CPR0_PRID] = pv; }
   /* Config: R4600 cache geometry (16 KB I$ + 16 KB D$, 32-byte lines, K0=3),
    * matching the real SGI Indy / MAME. mlreset derives cachecolormask from this;
@@ -253,9 +258,12 @@ void initState(state_t *s) {
    * streams diverge ~149k insns in.  Use CP0CONFIG=0x0002e4a3 to match the RTL.
    * Do NOT change the default -- IRIX needs the Indy/MAME geometry (see above).
    * --cpu r5000: same word with IC=DC=3 (32 KB each, 2-way on the R5000), still
-   * SC=1 (no secondary cache: the R5000PC Indy, SPEC95's "no L2" machine). */
+   * SC=1 (no secondary cache: the R5000PC Indy, SPEC95's "no L2" machine).
+   * --cpu r10000: the R10000's own layout (IRIS mips_exec.rs; NetBSD MIPS4_CONFIG_*):
+   * IC[31:29]=DC[28:26]=3 (32 KB), SS[18:16]=1 (1 MB -- swept against the IP28 PROM by
+   * IRIS; 4 passes POST but IRIX reports 8 MB), BE, SB[13]=1 (128-byte lines), K0=2. */
   { const char *ce = getenv("CP0CONFIG");
-    uint32_t cv = ce ? (uint32_t)strtoull(ce, 0, 0) : (globals::cpu_r5000 ? 0x0002e6f3u : 0x0002e4b3u);
+    uint32_t cv = ce ? (uint32_t)strtoull(ce, 0, 0) : (globals::cpu_r10000 ? 0x6c01a002u : globals::cpu_r5000 ? 0x0002e6f3u : 0x0002e4b3u);
     /* SCSIZE=<bytes>: claim a secondary cache (Config.SC=0) so IRIX sizes it and
      * issues SD cache ops; SCLINE=<16|32|64|128> sets Config.SB (default 16).  The
      * ISS has no caches: SD ops are only logged (SCLOG) and the tag ops emulated
@@ -434,6 +442,21 @@ void device_poll_and_deliver(state_t *s) {
     }
     else {
       s->cpr0[CPR0_CAUSE] &= ~(1u << 11);
+    }
+  }
+  /* --ip28: i8254 counter 0 (rtclock) -> IP4 (bit 12), counter 1 (kgclock) -> IP5 (bit 13) */
+  if(globals::ip28 && s->hpc) {
+    if(s->hpc->pit_irq(0)) {
+      s->cpr0[CPR0_CAUSE] |= (1u << 12);
+    }
+    else {
+      s->cpr0[CPR0_CAUSE] &= ~(1u << 12);
+    }
+    if(s->hpc->pit_irq(1)) {
+      s->cpr0[CPR0_CAUSE] |= (1u << 13);
+    }
+    else {
+      s->cpr0[CPR0_CAUSE] &= ~(1u << 13);
     }
   }
   uint32_t sr = s->cpr0[CPR0_SR], cause = s->cpr0[CPR0_CAUSE];
@@ -795,10 +818,16 @@ static void tlb_set_fault_state(state_t *s, uint64_t va) {
   s->cpr0_64[CPR0_CONTEXT] = ctx;
   s->cpr0[CPR0_CONTEXT]    = (uint32_t)ctx;
 
-  /* XContext: [3:0]=0, [30:4]=VA[39:13] (BadVPN2), [32:31]=R; preserve PTEBase. */
-  uint64_t xctx = s->cpr0_64[CPR0_XCONTEXT] & ~0x1ffffffffULL;
-  xctx |= ((va >> 13) & 0x7ffffffULL) << 4;           /* BadVPN2 -> [30:4] */
-  xctx |= r << 31;                                    /* R -> [32:31] */
+  /* XContext: [3:0]=0, BadVPN2 = VA[vb-1:13] at [vb-10:4], R at [vb-8:vb-9], PTEBase above
+   * (preserved), where vb is the virtual address width: 40 on the R4000 family
+   * ([30:4], R [32:31]), 44 on the R10000 ([34:4], R [36:35], PTEBase from 37 -- IRIS
+   * xcontext_on_miss).  The IP28 kernel's K2 heap sets VA[43:40] (0xc0000fc0...), so
+   * the R4400 layout hands its refill handler the wrong PTE address.  EntryHi and the
+   * TLB match stay 40-bit, as in IRIS. */
+  const uint32_t vb = globals::cpu_r10000 ? 44 : 40;
+  uint64_t xctx = s->cpr0_64[CPR0_XCONTEXT] & (~0ULL << (vb - 7));
+  xctx |= ((va >> 13) & ((1ULL << (vb - 13)) - 1)) << 4;  /* BadVPN2 */
+  xctx |= r << (vb - 9);                                   /* R */
   s->cpr0_64[CPR0_XCONTEXT] = xctx;
   s->cpr0[CPR0_XCONTEXT]    = (uint32_t)xctx;
 }
@@ -923,7 +952,7 @@ static void raise_tlb(state_t *s, uint64_t va, uint32_t exccode,
       fprintf(stderr, "[KPTE] fault on 0xff800000: faultPC=%08x EPC=%08x exl=%d code=%u refill=%d ctx=%08x icnt=%lu\n",
               (uint32_t)s->pc, s->cpr0[CPR0_EPC], exl_was_set?1:0, exccode, is_refill,
               s->cpr0[CPR0_CONTEXT], (unsigned long)s->icnt);
-      for(int i = 0; i < state_t::NUM_TLB_ENTRIES; i++)
+      for(int i = 0; i < tlb_entries(); i++)
         if(s->tlb[i].entry_hi || (s->tlb[i].entry_lo0 | s->tlb[i].entry_lo1) & 0x2)
           fprintf(stderr, "   tlb[%2d] hi=%016llx lo0=%016llx lo1=%016llx pm=%08x\n", i,
                   (unsigned long long)s->tlb[i].entry_hi,
@@ -1001,7 +1030,7 @@ static void iss_tlbdup_check(state_t *s, uint32_t idx, const char *how) {
   bool gl = (lo0 & 1u) && (lo1 & 1u);
   bool vld = ((lo0 >> 1) & 1u) || ((lo1 >> 1) & 1u);
   if(!vld) return;                                   /* skip invalid placeholder writes */
-  for(int j = 0; j < state_t::NUM_TLB_ENTRIES; j++) {
+  for(int j = 0; j < tlb_entries(); j++) {
     if((uint32_t)j == idx) continue;
     uint64_t jhi = s->tlb[j].entry_hi, jl0 = s->tlb[j].entry_lo0, jl1 = s->tlb[j].entry_lo1;
     bool jvld = ((jl0 >> 1) & 1u) || ((jl1 >> 1) & 1u);
@@ -1066,7 +1095,7 @@ static void uitlb_model_fetch(state_t *s, uint64_t va, uint64_t cur_asid) {
       m.miss_user++;
     }
     /* install from the 48-way (same Sail match as va_translate_inner) */
-    for(int i = 0; i < state_t::NUM_TLB_ENTRIES; i++) {
+    for(int i = 0; i < tlb_entries(); i++) {
       const uint64_t pm = s->tlb[i].page_mask & 0x1ffe000ULL;
       const uint64_t vpnMask = (~(uint64_t)(pm | 0x1fffULL)) & 0x000000ffffffe000ULL;
       const uint64_t e_hi = s->tlb[i].entry_hi;
@@ -1211,7 +1240,7 @@ static uint32_t va_translate_inner(state_t *s, uint64_t va, tlb_op op) {
    *   r=VA[63:62], vpn2=VA[39:13];
    *   valid & (r==entryR) & ((vpn2 & vpnMask)==(entryVPN & vpnMask)) & (asid|G).
    * No narrow/wide and R is ALWAYS compared (the spec has no 32-bit shortcut). */
-  for(int i = 0; i < state_t::NUM_TLB_ENTRIES; i++) {
+  for(int i = 0; i < tlb_entries(); i++) {
     uint64_t pm     = s->tlb[i].page_mask & 0x1ffe000ULL; /* mask bits [24:13] */
     uint64_t vpnMask= (~(uint64_t)(pm | 0x1fffULL)) & 0x000000ffffffe000ULL; /* VPN2[39:13] */
     uint64_t e_hi   = s->tlb[i].entry_hi;
@@ -1305,7 +1334,7 @@ static uint32_t va_translate_inner(state_t *s, uint64_t va, tlb_op op) {
     fprintf(stderr, "[tlb-refill] va=%016llx op=%d asid=%llx pc=%08x\n",
             (unsigned long long)va, (int)op, (unsigned long long)cur_asid,
             (uint32_t)s->pc);
-    for(int i = 0; i < state_t::NUM_TLB_ENTRIES; i++) {
+    for(int i = 0; i < tlb_entries(); i++) {
       if((s->tlb[i].entry_lo0 | s->tlb[i].entry_lo1) & 0x2)
         fprintf(stderr, "   tlb[%2d] hi=%016llx lo0=%016llx lo1=%016llx pm=%08x\n",
                 i, (unsigned long long)s->tlb[i].entry_hi,
@@ -1390,6 +1419,122 @@ static uint32_t ip22_probe_window(state_t *s, uint32_t pa, tlb_op op) {
   return (op == tlb_op::store ? 0x2ffff000u : 0x2fffe000u) | (pa & 0xfffu);
 }
 
+/* --ip28: the IP28 PROM programs MEMCFG in 16 MB units for both fields -- it sets base 0x20
+ * and probes 0x20000000 (+0x10000000) through XKPHYS, and its bank data test takes a size
+ * field of 0x0f as 256 MB -- where the MC spec has 4 MB units (base vs address bits 29:22,
+ * 512 MB max).  An Indigo2 R10000 takes 1 GB of 128 MB SIMMs, so the rev D MC must scale
+ * both by 4; this model follows the PROM.  A bank decodes [base, base + size),
+ * size = (field + 1) * 16 MB.  Bank 0 holds 4 x 64 MB SIMMs = the 256 MB at
+ * 0x08000000..0x17ffffff (the PROM's sizing steps x4 from 256 MB, so a 128 MB bank reads as
+ * a 256 MB one that wraps); a larger configured size wraps onto it as real SIMMs alias.
+ * Banks 1..3 and unmapped addresses are empty: loads read 0, stores vanish (scratch pages). */
+static uint32_t ip28_mem_window(state_t *s, uint32_t pa, tlb_op op) {
+  for(int b = 0; b < 4; b++) {
+    const uint32_t reg = (b < 2) ? s->mc->memcfg0_cpu() : s->mc->memcfg1_cpu();
+    const uint32_t cfg = ((b & 1) ? reg : (reg >> 16)) & 0xffffu;
+    if(((cfg >> 13) & 1) == 0) {
+      continue;
+    }
+    const uint32_t base = (cfg & 0xffu) << 24;
+    const uint32_t size = (((cfg >> 8) & 0x1fu) + 1u) << 24;
+    if(pa >= base && (pa - base) < size) {
+      if(b == 0) {
+        return 0x08000000u + ((pa - base) & 0x0fffffffu);
+      }
+      break;
+    }
+  }
+  return (op == tlb_op::store ? 0x3ffff000u : 0x3fffe000u) | (pa & 0xfffu);   /* not 0x2.......: mc_alias folds those */
+}
+
+/* --ip28: the R10000's CACHE index ops, as a shadow that only CACHE touches (after IRIS's
+ * src/cpu/mips_cache_shadow.rs).  Loads/stores never consult it -- memory is the only store,
+ * so the hit/invalidate/writeback ops stay no-ops -- but the IP28 PROM's cache diagnostics
+ * round-trip tags, data and check bits through it:
+ *   op 2 Index_Store_Tag  <- TagHi:TagLo        op 1 Index_Load_Tag -> TagHi:TagLo
+ *   op 7 Index_Store_Data <- TagHi:TagLo, ECC   op 6 Index_Load_Data -> TagHi:TagLo, ECC (SD)
+ *   op 5 (PI) = cache barrier
+ * The R10000 reassigns 5/6/7 (R4000 hit ops) as index ops, so none of them translate.
+ * Index bit 0 selects the way.  TagHi[31] is the MRU bit: one per SET, shared by both ways --
+ * the PROM sets it through way 0 and reads it back through way 1.  Geometry: 32K/64B I,
+ * 32K/32B D, 1M/128B S, all 2-way.  Returns false for ops it leaves to the normal path. */
+static bool ip28_cache_op(state_t *s, uint32_t cop, uint64_t va) {
+  struct shadow_t {
+    std::vector<uint64_t> tags;
+    std::vector<uint8_t> mru;
+    std::vector<uint64_t> data;
+    std::vector<uint32_t> ecc;
+  };
+  static const uint32_t line_bytes[4] = {64, 32, 128, 128};
+  static const uint32_t cache_bytes[4] = {32u << 10, 32u << 10, 1u << 20, 1u << 20};
+  static shadow_t sh[3];                       /* I, D, S (SI and SD name one array) */
+  const uint32_t which = cop & 3, op = (cop >> 2) & 7;
+  /* IP28CACHELOG: the tag/data index ops (the only ones the shadow answers) issued
+   * outside the PROM -- does anything but a diagnostic need the shadow? */
+  static const bool g_cachelog = getenv("IP28CACHELOG") != nullptr;
+  if(g_cachelog && (op == 1 || op == 2 || op == 6 || op == 7) && (s->pc >> 32) != 0xffffffffULL) {
+    fprintf(stderr, "[ip28cache] op=%u sel=%u va=%016llx pc=%016llx icnt=%llu\n", op, which,
+            (unsigned long long)va, (unsigned long long)s->pc, (unsigned long long)s->icnt);
+  }
+  shadow_t &c = sh[which < 2 ? which : 2];
+  const uint64_t lines = cache_bytes[which] / line_bytes[which];
+  if(c.tags.empty()) {
+    c.tags.assign(lines, 0);
+    c.mru.assign(lines / 2, 0);
+    if(which >= 2) {                           /* only the secondary has a data shadow */
+      c.data.assign(cache_bytes[which] / 8, 0);
+      c.ecc.assign(cache_bytes[which] / 8, 0);
+    }
+  }
+  const uint64_t way = va & 1;
+  const uint64_t set = (va / line_bytes[which]) % (lines / 2);
+  const uint64_t tidx = set * 2 + way;
+  const uint64_t taghilo = ((uint64_t)(uint32_t)s->cpr0[29] << 32) | (uint32_t)s->cpr0[28];
+  const uint64_t mru_bit = 1ULL << 63;
+  uint64_t result;
+  switch(op)
+    {
+    case 2: /* Index_Store_Tag */
+      c.mru[set] = (taghilo & mru_bit) != 0;
+      c.tags[tidx] = taghilo & ~mru_bit;
+      return true;
+    case 1: /* Index_Load_Tag */
+      result = c.tags[tidx] | (c.mru[set] ? mru_bit : 0);
+      break;
+    case 5: /* PI: cache barrier */
+      return which == 0;
+    case 6: /* Index_Load_Data (PI/PD read back 0: no primary data shadow) */
+      if(which == 2) {
+        return false;
+      }
+      result = 0;
+      if(!c.data.empty()) {
+        const uint64_t d = ((va >> 4) * 2 + way) % c.data.size();
+        result = c.data[d];
+        s->cpr0[26] = c.ecc[d];
+        s->cpr0_64[26] = c.ecc[d];
+      }
+      break;
+    case 7: /* Index_Store_Data (SI/SD) */
+      if(which < 2) {
+        return false;
+      }
+      {
+        const uint64_t d = ((va >> 4) * 2 + way) % c.data.size();
+        c.data[d] = taghilo;
+        c.ecc[d] = (uint32_t)s->cpr0[26];
+      }
+      return true;
+    default:
+      return false;
+    }
+  s->cpr0_64[28] = (uint32_t)result;
+  s->cpr0[28] = (uint32_t)result;
+  s->cpr0_64[29] = (uint32_t)(result >> 32);
+  s->cpr0[29] = (uint32_t)(result >> 32);
+  return true;
+}
+
 /* set by va_translate_slow when its result must not go into the soft TLB (the PROM's bank-
  * probe window maps the same PA to different memory as MEMCFG changes) */
 static bool g_xlat_uncacheable = false;
@@ -1406,7 +1551,11 @@ static __attribute__((noinline)) uint32_t va_translate_slow(state_t *s, uint64_t
 #endif
   uint32_t pa = va_translate_inner(s, va, op);
   g_xlat_uncacheable = false;
-  if((pa >> 28) == 2 && s->mc) {
+  if(globals::ip28 && pa >= 0x20000000u && pa < 0x60000000u && s->mc) {
+    pa = ip28_mem_window(s, pa, op);
+    g_xlat_uncacheable = true;               /* depends on MEMCFG, not the TLB: never cache */
+  }
+  else if((pa >> 28) == 2 && s->mc) {
     pa = ip22_probe_window(s, pa, op);
     g_xlat_uncacheable = true;               /* depends on MEMCFG, not the TLB: never cache */
   }
@@ -1504,7 +1653,7 @@ static bool tlb_probe_ro(state_t *s, uint64_t va, uint32_t *pa) {
   bool wide = !(hi32 == 0x00000000u || hi32 == 0xffffffffu);
   uint64_t cur_asid = s->cpr0_64[CPR0_ENTRYHI] & 0xffULL;
   uint64_t cmp_mask = wide ? ~0x3ULL : 0xffffffffULL;
-  for(int i = 0; i < state_t::NUM_TLB_ENTRIES; i++) {
+  for(int i = 0; i < tlb_entries(); i++) {
     uint64_t pm     = s->tlb[i].page_mask & 0x1ffe000ULL;
     uint64_t mask   = (~(uint64_t)(pm | 0x1fffULL)) & cmp_mask;
     uint64_t e_hi   = s->tlb[i].entry_hi;
@@ -2151,7 +2300,7 @@ static void _cfc1(uint32_t inst, state_t *s) {
   uint32_t cr = (inst>>11) & 31;
   uint32_t rt = (inst>>16) & 31;
   /* GPR[rt] = sign_extend32(FCR[cr]); FCR0 is the read-only FIR */
-  uint32_t v = (cr == 0) ? (globals::cpu_r5000 ? 0x00002320u : 0x00000500u) : (uint32_t)s->fcr1[fcr_index(cr)];
+  uint32_t v = (cr == 0) ? (globals::cpu_r10000 ? 0x00000900u : globals::cpu_r5000 ? 0x00002320u : 0x00000500u) : (uint32_t)s->fcr1[fcr_index(cr)];
   s->gpr[rt] = (int64_t)(int32_t)v;
   s->pc += 4;
   HISTO(s, mipsInsn::CFC1);
@@ -3907,7 +4056,7 @@ static void exec_generic(uint32_t inst, state_t *s) {
 	{
 	case 0x1: { /* TLBR -- read TLB[Index] into staging regs */
 	  uint32_t idx = s->cpr0[CPR0_INDEX] & 63;
-	  if(idx < (uint32_t)state_t::NUM_TLB_ENTRIES) {
+	  if(idx < (uint32_t)tlb_entries()) {
 	    s->cpr0_64[CPR0_ENTRYHI]  = s->tlb[idx].entry_hi;
 	    s->cpr0_64[CPR0_ENTRYLO0] = s->tlb[idx].entry_lo0;
 	    s->cpr0_64[CPR0_ENTRYLO1] = s->tlb[idx].entry_lo1;
@@ -3922,7 +4071,7 @@ static void exec_generic(uint32_t inst, state_t *s) {
 	}
 	case 0x2: { /* TLBWI -- write staging regs to TLB[Index] */
 	  uint32_t idx = s->cpr0[CPR0_INDEX] & 63;
-	  if(idx < (uint32_t)state_t::NUM_TLB_ENTRIES) {
+	  if(idx < (uint32_t)tlb_entries()) {
 	    s->tlb[idx].entry_hi  = s->cpr0_64[CPR0_ENTRYHI];
 	    s->tlb[idx].entry_lo0 = s->cpr0_64[CPR0_ENTRYLO0];
 	    s->tlb[idx].entry_lo1 = s->cpr0_64[CPR0_ENTRYLO1];
@@ -3947,7 +4096,7 @@ static void exec_generic(uint32_t inst, state_t *s) {
 	}
 	case 0x6: { /* TLBWR -- write staging regs to TLB[Random] */
 	  uint32_t idx = s->cpr0[CPR0_RANDOM] & 63;
-	  if(idx < (uint32_t)state_t::NUM_TLB_ENTRIES) {
+	  if(idx < (uint32_t)tlb_entries()) {
 	    s->tlb[idx].entry_hi  = s->cpr0_64[CPR0_ENTRYHI];
 	    s->tlb[idx].entry_lo0 = s->cpr0_64[CPR0_ENTRYLO0];
 	    s->tlb[idx].entry_lo1 = s->cpr0_64[CPR0_ENTRYLO1];
@@ -3965,7 +4114,7 @@ static void exec_generic(uint32_t inst, state_t *s) {
 	    uint32_t wired  = s->cpr0[CPR0_WIRED] & 63;
 	    uint32_t random = s->cpr0[CPR0_RANDOM] & 63;
 	    s->cpr0[CPR0_RANDOM] = (random <= wired)
-	      ? (uint32_t)(state_t::NUM_TLB_ENTRIES - 1) : (random - 1);
+	      ? (uint32_t)(tlb_entries() - 1) : (random - 1);
 	  }
 	  static const bool tlblog = getenv("TLBLOG") != nullptr;
 	  if(tlblog && idx < 8) fprintf(stderr, "[TLBWR] idx=%2u hi=%016llx lo0=%016llx lo1=%016llx\n",
@@ -3978,7 +4127,7 @@ static void exec_generic(uint32_t inst, state_t *s) {
 	  uint64_t probe_hi   = s->cpr0_64[CPR0_ENTRYHI];
 	  uint64_t probe_asid = probe_hi & 0xffu;
 	  bool found = false;
-	  for(int i = 0; i < state_t::NUM_TLB_ENTRIES; i++) {
+	  for(int i = 0; i < tlb_entries(); i++) {
 	    /* Apply page-mask to get the significant VPN2 bits */
 	    uint64_t mask    = ~(uint64_t)(s->tlb[i].page_mask | 0x1fffu);
 	    bool global      = (s->tlb[i].entry_lo0 & 1u) &&
@@ -4377,6 +4526,10 @@ static void exec_generic(uint32_t inst, state_t *s) {
 	  uint32_t cop = (inst >> 16) & 31;       /* [20:18]=op  [17:16]=cache(0=I,1=D,2=SI,3=SD) */
 	  int16_t  himm = (int16_t)(inst & 0xffff);
 	  uint64_t va  = s->gpr[rs] + (int32_t)himm;
+	  if(globals::ip28 && ip28_cache_op(s, cop, va)) {
+	    s->pc += 4;
+	    break;
+	  }
 	  { static const bool g_watchinvl = getenv("WATCHINVL") != nullptr;
 	    if(g_watchinvl) {
 	      uint32_t wpa = 0; bool wm = tlb_probe_ro(s, va, &wpa);
@@ -5065,6 +5218,10 @@ static void exec_itype(uint32_t inst, state_t *s) {
 	  uint32_t cop = (inst >> 16) & 31;       /* [20:18]=op  [17:16]=cache(0=I,1=D,2=SI,3=SD) */
 	  int16_t  himm = (int16_t)(inst & 0xffff);
 	  uint64_t va  = s->gpr[rs] + (int32_t)himm;
+	  if(globals::ip28 && ip28_cache_op(s, cop, va)) {
+	    s->pc += 4;
+	    break;
+	  }
 	  { static const bool g_watchinvl = getenv("WATCHINVL") != nullptr;
 	    if(g_watchinvl) {
 	      uint32_t wpa = 0; bool wm = tlb_probe_ro(s, va, &wpa);

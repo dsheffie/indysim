@@ -49,6 +49,24 @@ private:
   uint64_t wr_lba = 0;              /* pending WRITE target (drained from buf) */
   uint8_t  sense[18] = {0};         /* REQUEST SENSE fixed-format data */
   uint8_t  tgt_status = 0;          /* target STATUS byte -> WD33C93 reg 0x0f after a transfer */
+  /* Select-with-ATN (0x06) + Transfer Info: the step-by-step path the Linux wd33c93
+   * driver uses for every target's first command (IRIX uses only the fused 0x08).
+   * The target walks MESSAGE OUT -> (MESSAGE IN reject of an SDTR) -> COMMAND ->
+   * DATA (by DMA, through a level-2 0x08 with Command Phase 0x45) or STATUS ->
+   * MESSAGE IN, one interrupt per phase; message/CDB/status bytes move through
+   * the data register (reg 0x19) by PIO. */
+  enum tphase_t { TP_NONE, TP_MSG_OUT, TP_COMMAND, TP_DATA, TP_STATUS, TP_MSG_IN };
+  tphase_t tphase = TP_NONE;        /* target bus phase while connected by 0x06 */
+  std::vector<uint8_t> pio;         /* bytes moved by the current Transfer Info */
+  size_t   pio_need = 0;            /* Transfer Info byte count */
+  size_t   pio_pos = 0;             /* bytes the CPU has read of pio (target -> CPU) */
+  bool     pio_dbr = false;         /* data register ready for the CPU (PIO, not DMA) */
+  bool     pio_in = false;          /* PIO direction: target -> CPU */
+  std::vector<uint8_t> msg_in;      /* MESSAGE IN bytes still to send, one per Negate ACK */
+  bool     msg_done = false;        /* msg_in is COMMAND COMPLETE: disconnect after it */
+  uint8_t  pending_st = 0;          /* next interrupt, raised when Status is read */
+  bool     decoding_atn = false;    /* decode_cdb() from the 0x06 path: arm nothing */
+  bool     atn_nodata = false;      /* ... and the command has no data phase */
   std::unordered_map<uint64_t, std::vector<uint8_t>> overlay; /* COW writes */
   std::string delta_path;           /* optional sidecar persisting the overlay */
 
@@ -57,6 +75,13 @@ private:
   void block_write(uint64_t lba, const uint8_t *src);
   void exec_command(uint8_t cc);    /* a WD33C93 command was written to reg 0x18 */
   void select_and_transfer();       /* decode CDB -> arm data phase / complete */
+  bool select_timeout();            /* no device at the destination ID: post 0x42 */
+  void decode_cdb();                /* regs[WD_CDB..] -> data phase / no data */
+  void raise_int(uint8_t st, uint8_t phs);   /* post a WD33C93 interrupt */
+  void select_atn();                /* 0x06 */
+  void transfer_info(bool sbt);     /* 0x20 (0xa0 single byte) while connected by 0x06 */
+  void negate_ack();                /* 0x03 */
+  void pio_done();                  /* the current Transfer Info moved its last byte */
   void begin_data_in(const uint8_t *p, size_t n);  /* -> PH_DATA_IN */
   void begin_data_out(size_t n);                   /* -> PH_DATA_OUT */
   void finish();                    /* data phase drained -> status + INTRQ */

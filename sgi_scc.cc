@@ -1,4 +1,5 @@
 #include "sgi_scc.hh"
+#include "interpret.hh"
 #include <cstdio>
 #include <cstdlib>
 #include <unistd.h>
@@ -6,6 +7,8 @@
 
 static const bool scc_rx_dbg = getenv("SCCRX") != nullptr;
 
+static const uint8_t RR0_DCD = 0x08;    /* Data Carrier Detect (bit3) */
+static const uint8_t RR0_CTS = 0x20;    /* Clear To Send (bit5) */
 /* RR0 bit0 = Rx Character Available (set while the chanA Rx FIFO is non-empty). */
 static const uint8_t RR0_RX_AVAIL = 0x01;
 
@@ -123,14 +126,17 @@ uint8_t sgi_scc::read(uint32_t offs) {
      * framing error and never delivered up the stream (post-login console hang). */
     return tx_busy[ch] ? 0x00 : 0x01;        /* D0 All Sent; all error bits clear */
   }
-  /* RR0: Tx Buffer Empty + All Sent iff no char is shifting out; bit0 = Rx avail */
-  uint8_t rr0 = tx_busy[ch] ? 0 : (RR0_TX_EMPTY | RR0_ALL_SENT);
+  /* RR0: Tx Buffer Empty + All Sent iff no char is shifting out; bit0 = Rx avail.
+   * DCD (bit3) and CTS (bit5) read asserted: a terminal is attached and ready, as
+   * IRIS's z85c30 reports. */
+  uint8_t rr0 = (tx_busy[ch] ? 0 : (RR0_TX_EMPTY | RR0_ALL_SENT)) | RR0_DCD | RR0_CTS;
   if(rx_count > 0) rr0 |= RR0_RX_AVAIL;
   return rr0;
 }
 
 void sgi_scc::write(uint32_t offs, uint8_t b) {
   int ch = chan(offs);
+  if(scc_rx_dbg) fprintf(stderr, "[scc] write ch=%d %s ptr=%u v=%02x pc=%016llx\n", ch, is_data_reg(offs) ? "data" : "ctrl", ptr[ch], b, (unsigned long long)s->pc);
   /* WR8 (the Tx buffer through the control port) is the data register too: the
    * SGI PROM's early putc writes WR0 = point-high, then the char. */
   if(is_data_reg(offs) || (ptr[ch] == 8)) {

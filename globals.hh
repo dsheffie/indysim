@@ -29,6 +29,15 @@ namespace globals {
    * and enable the MIPS IV instructions.  Default (false) is the R4400 / MIPS III
    * machine r9999 implements: MIPS IV ops raise RI (or FP Unimplemented). */
   extern bool cpu_r5000;
+  /* --cpu r10000: present an R10000 (IP28): PRId 0x0925, FIR 0x0900, the R10000 Config
+   * layout (32K+32K L1, 1 MB secondary with 128-byte lines), and a 64-entry TLB.  It
+   * also sets cpu_r5000, which the ISA gates read as "a MIPS IV part". */
+  extern bool cpu_r10000;
+  /* --ip28: Indigo2 R10000 (IP28) board differences from the Indy, enough to run the
+   * IP28 PROM further: INT2 + its 8254 at 0x1fbd9000 (the Indy's ISDN window) instead
+   * of the IOC2's INT3 at 0x1fbd9880, and an MC reporting revision D, which the IP28
+   * PROM requires.  The CPU stays the R4400 model; graphics is absent unless --newport. */
+  extern bool ip28;
 };
 
 #endif

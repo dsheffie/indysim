@@ -2,6 +2,7 @@
 #define __sgi_hpc__
 
 #include <cstdint>
+#include <cstdio>
 #include <ctime>
 #include <cstddef>
 
@@ -83,7 +84,26 @@ class sgi_hpc {
   uint8_t  t2_rd_phase = 0;      /* read: 0=return low byte, 1=return high byte */
   bool     t2_loading = false;   /* an RW=both program is in progress */
   uint16_t t2_value();           /* live down-counted value, derived from CP0 Count */
+  /* --ip28: i8254 counters 0 and 1 as periodic interrupt sources.  The IP28 kernel
+   * runs its scheduler clock (rtclock) on counter 0 and its profiling clock (kgclock)
+   * on counter 1, on CPU Cause IP4 / IP5 -- where the Indy's R4400 kernel ticks on CP0
+   * Count/Compare.  Counters 0/1 are clocked by counter 2's output (the prescaler).
+   * The interrupt latches when a period elapses; the timer-clear register (INT3/INT2
+   * offset 0x20, bit 0 / bit 1) drops it. */
+  struct pit_counter_t {
+    uint16_t load = 0;
+    uint8_t  wr_phase = 0;
+    bool     loading = false;
+    bool     armed = false;
+    bool     irq = false;
+    uint32_t period = 0;         /* in CP0 Count ticks */
+    uint32_t next_fire = 0;      /* CP0 Count value of the next terminal count */
+  };
+  pit_counter_t pit[2];
+  uint32_t pit_period(uint16_t load) const;
 public:
+  /* --ip28: counter n (0/1) has a latched interrupt -> CP0 Cause IP4 / IP5 */
+  bool pit_irq(int n);
   /* true when an unmasked local0 interrupt is pending -> drive CP0 Cause IP2 */
   bool ioc2_ip2_pending() { return (ioc2_local0_live() & ioc2_local_mask[0]) != 0; }
   /* local1 status incl. live Newport vertical retrace (0x80); unmasked -> CP0 Cause IP3 */
@@ -93,6 +113,12 @@ public:
     return ioc2_local_mask[1] != 0 && (ioc2_local1_live() & ioc2_local_mask[1]) != 0;
   }
   void enet_poll();   /* drain the tap into the Seeq + deliver pending RX via DMA */
+  /* SIGUSR1 interrupt-state dump: local0/1 live + masks, mappable status + masks */
+  void dump_irq(FILE *fp) {
+    fprintf(fp, "[irq] local0 live=%02x mask=%02x  local1 live=%02x mask=%02x  map live=%02x mask0=%02x mask1=%02x  ip2=%d ip3=%d\n",
+            ioc2_local0_live(), ioc2_local_mask[0], ioc2_local1_live(), ioc2_local_mask[1],
+            ioc2_vmeistat_live(), ioc2_cmeimask[0], ioc2_cmeimask[1], ioc2_ip2_pending(), ioc2_ip3_pending());
+  }
   sgi_hpc(state_t *s) : s(s), intstat(0), misc(0) { rtc_ram_load(); }
   /* NVRAM_FILE=<path>: the ds1386 battery-backed RAM -- on an Indy (IP24) this holds
    * the PROM environment (eaddr, monitor, console, ...) -- persists across runs:

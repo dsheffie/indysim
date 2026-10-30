@@ -135,14 +135,16 @@ public:
   std::unordered_map<mipsInsn,uint64_t> insn_histo;
 #endif
 
-  /* Software TLB -- mirrors the 48-entry fully-associative RTL TLB */
+  /* Software TLB -- mirrors the 48-entry fully-associative RTL TLB; --cpu r10000 uses
+   * 64 (interpret.cc tlb_entries()).  Checkpoints still save only the first 48. */
   static const int NUM_TLB_ENTRIES = 48;
+  static const int MAX_TLB_ENTRIES = 64;
   struct tlb_entry_t {
     uint64_t entry_hi  = 0;   /* R[63:62] + VPN2[39:13] + ASID[7:0] */
     uint64_t entry_lo0 = 0;   /* PFN[33:6] + C[5:3] + D[2] + V[1] + G[0] */
     uint64_t entry_lo1 = 0;
     uint32_t page_mask = 0;   /* variable page size bits [24:13] */
-  } tlb[NUM_TLB_ENTRIES];
+  } tlb[MAX_TLB_ENTRIES];
   /* 64-bit CP0 shadow registers for DMTC0/DMFC0 (EntryHi, EntryLo, XContext) */
   uint64_t cpr0_64[32] = {0};
 
@@ -413,6 +415,7 @@ bool is_store_insn(state_t *s);
 #define PRID_R4600  0x00002020u   /* imp 0x20, rev 0x20 -- the SGI Indy CPU */
 #define PRID_R10000 0x00000900u   /* imp 0x09, rev 0x00 */
 #define PRID_R5000  0x00002320u   /* imp 0x23, rev 0x20 -- R5000 Indy (--cpu r5000) */
+#define PRID_R10000 0x00000925u   /* imp 0x09, rev 2.5 -- R10000 (--cpu r10000); the IP28 PROM skips its boot tune below rev 2.0 (IRIS) */
 /* The real SGI Indy (and MAME's indy_4610) is an R4600. IRIX's `start` reads
  * PRId and selects per-CPU init (cache config, TLB-refill handler variant,
  * cache-op handling) by the IMP field; presenting R4000 (imp 0x04) makes IRIX

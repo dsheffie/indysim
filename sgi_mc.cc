@@ -2,6 +2,7 @@
 #include "helper.hh"
 #include "interpret.hh"
 #include "sgi_newport.hh"
+#include "globals.hh"
 #include <cstdio>
 #include <cstdlib>
 
@@ -115,7 +116,10 @@ uint32_t sgi_mc::read(uint32_t offs, size_t sz) {
     case 0x1c:   /* systemid */
       /* MC System ID: low nibble = revision, bit4 (EPRESENT) = EISA present.
        * Indy has no EISA, so EPRESENT stays clear. */
-      x = sys_id;
+      /* --ip28: 0x15, as IRIS reports -- once the HPC3 says Full House the IP28 PROM
+       * rejects any revision below 5 ("Rev A/BC MC detected--Need rev D or greater");
+       * 4 only got past its earlier, Indy-path check.  bit4 set: Full House has EISA. */
+      x = globals::ip28 ? 0x15000000 : sys_id;
       break;
     case 0x30:   /* eeprom (even alias) */
     case 0x34:   /* eeprom: control bits as written, SDATAI (0x10) = the EEPROM's DI pin */
